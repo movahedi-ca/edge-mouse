@@ -1,0 +1,41 @@
+[package]
+name = "edge-mouse"
+version = "0.1.0"
+edition = "2021"
+description = "Edge-local mouse control for X11: calibrated target resolution, Fitts-timed movement, predicate-verified actuation"
+license = "MIT"
+
+[lib]
+name = "edge_mouse"
+path = "src/lib.rs"
+
+[features]
+default = []
+# CDP frame-chain capture (chromiumoxide). Runs on the caller's async
+# runtime; never on the input/X11 thread. The core crate is sync-only.
+cdp = ["chromiumoxide"]
+
+[dependencies]
+# Error handling
+anyhow = "1"
+# Serialization (resolver gates, run journal, S1 metadata)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# X11 / XTest input (same feature set as the bridge driver)
+x11rb = { version = "0.13", features = ["xinput", "xtest", "damage"] }
+# Run ids
+uuid = { version = "1", features = ["v4"] }
+# Lock-free SPSC ring for the input thread (pinned: soundness-critical)
+rtrb = "0.4.1"
+# Bounded O(1) LRU for the identity cache
+indexmap = "2"
+# Durable run journal
+rusqlite = { version = "0.31", features = ["bundled"] }
+# Capture encode/decode and crop-and-zoom (PNG + JPEG only)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Monotonic-clock deadline scheduling
+libc = "0.2"
+# Optional: CDP frame-chain capture (feature `cdp`)
+chromiumoxide = { version = "0.7", optional = true }
+
+[dev-dependencies]
