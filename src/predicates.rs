@@ -100,12 +100,25 @@ impl EvalCtx {
 /// absent where absence is not evidence. Callers must never treat
 /// `Unknown` as confirmation.
 pub fn eval(predicate: &Predicate, ctx: &EvalCtx) -> PredicateValue {
+    eval_with_target(predicate, ctx, ctx.target_node_id)
+}
+
+/// Evaluate with an explicit target override (v1.2, fix 32). The old
+/// call sites cloned the entire `EvalCtx` (a `Vec<AxNode>` with Strings)
+/// just to set `target_node_id`; this borrows instead.
+pub fn eval_with_target(
+    predicate: &Predicate,
+    ctx: &EvalCtx,
+    target_id: Option<u64>,
+) -> PredicateValue {
     // Empty perception answers nothing honestly.
     if ctx.nodes.is_empty() {
         return PredicateValue::Unknown;
     }
+    let target: Option<&AxNode> =
+        target_id.and_then(|id| ctx.nodes.iter().find(|n| n.node_id == id));
     match predicate {
-        Predicate::EnabledVisible => match ctx.target() {
+        Predicate::EnabledVisible => match target {
             Some(n) => PredicateValue::Bool(n.enabled && n.visible),
             None => PredicateValue::Unknown,
         },
@@ -123,15 +136,15 @@ pub fn eval(predicate: &Predicate, ctx: &EvalCtx) -> PredicateValue {
                 .any(|n| n.attributes.iter().any(|(k, v)| k == name && v == value));
             PredicateValue::Bool(hit)
         }
-        Predicate::RoleIs(role) => match ctx.target() {
+        Predicate::RoleIs(role) => match target {
             Some(n) => PredicateValue::Bool(n.role.eq_ignore_ascii_case(role)),
             None => PredicateValue::Unknown,
         },
-        Predicate::ValueEquals(want) => match ctx.target() {
+        Predicate::ValueEquals(want) => match target {
             Some(n) => PredicateValue::Bool(n.value == *want),
             None => PredicateValue::Unknown,
         },
-        Predicate::AttributeMatches { name, pattern } => match ctx.target() {
+        Predicate::AttributeMatches { name, pattern } => match target {
             Some(n) => match n.attributes.iter().find(|(k, _)| k == name) {
                 Some((_, v)) => PredicateValue::Bool(match_pattern(v, pattern)),
                 // Attribute absent on a present node: the pattern does not
@@ -141,7 +154,7 @@ pub fn eval(predicate: &Predicate, ctx: &EvalCtx) -> PredicateValue {
             },
             None => PredicateValue::Unknown,
         },
-        Predicate::Focused => match ctx.target() {
+        Predicate::Focused => match target {
             Some(n) => PredicateValue::Bool(n.focused),
             None => PredicateValue::Unknown,
         },

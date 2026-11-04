@@ -1,9 +1,9 @@
 [package]
 name = "edge-mouse"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Edge-local mouse control for X11: calibrated target resolution, Fitts-timed movement, predicate-verified actuation"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [lib]
 name = "edge_mouse"
@@ -44,8 +44,14 @@ chromiumoxide = { version = "0.7", optional = true }
 # The audit found this section entirely missing: the release binary was
 # shipping with default optimization. These are the standard settings for
 # a latency-sensitive native binary.
+#
+# NOTE: `panic = "abort"` was REMOVED (v1.2, L1). The OCR worker in
+# perceive.rs isolates panicking jobs with `catch_unwind`, which cannot
+# catch anything under the abort strategy: a panicking OCR job would
+# abort the entire process in production while `cargo test` (dev profile,
+# unwinding) kept passing. The cost of unwinding is a slightly larger
+# binary; there are no other catch_unwind users to audit.
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 opt-level = 3
 strip = "symbols"

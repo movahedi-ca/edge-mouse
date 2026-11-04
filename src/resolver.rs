@@ -55,7 +55,7 @@ use indexmap::IndexMap;
 use super::coords::{
     document_to_main_viewport, CoordError, FrameDocumentCss, FrameTransform, MainViewportCss,
 };
-use super::features::{self, FeatureInputs, FEATURE_SCHEMA_VERSION};
+use super::features::{self, FEATURE_SCHEMA_VERSION};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -72,6 +72,14 @@ pub const TOP_K: usize = 8;
 pub const REFINEMENT_MIN_PX: f64 = 12.0;
 /// Identity-cache capacity (bounded O(1) LRU).
 pub const IDENTITY_CACHE_CAP: usize = 512;
+/// Embedding-cache capacity (v1.2, fix 33): bounds the
+/// (backend_node_id, text_hash) -> [f32; 64] cache across generations.
+pub const EMB_CACHE_CAP: usize = 4096;
+/// Absolute BM25 score floor (v1.2, fix 4): a top-1 score below this
+/// never passes the stage-1 gates, even with a perfect margin. Guards
+/// degenerate single-term matches that would otherwise sail through on
+/// margin 1.0 / share 1.0.
+pub const BM25_SCORE_FLOOR: f64 = 0.5;
 /// Confidence carried by an identity-cache hit: the node was Confirmed by
 /// the verifier before it was cached, so this is a policy value for a
 /// verified prior, not a measured precision.
@@ -214,6 +222,10 @@ pub struct PreparedNode {
     pub generation: u64,
     /// Normalized accessible name (exact-match stage, feature 4).
     pub name_norm: Box<str>,
+    /// Normalized visible text content (v1.2, fix 5: schema v2 feeds
+    /// name + text to Jaccard, edit similarity, dims 72..136, and the
+    /// dot product, matching what stage 1 BM25 already scores).
+    pub text_norm: Box<str>,
     /// Normalized role string.
     pub role_norm: Box<str>,
     /// Interned token ids of the role (for the role-intent flag).
@@ -365,6 +377,7 @@ pub fn prepare_candidate(
             backend_node_id,
             generation,
             name_norm: name_norm.into(),
+            text_norm: text_norm.into(),
             role_norm: role_norm.into(),
             role_token_ids,
             token_ids,
@@ -420,9 +433,12 @@ impl Ord for Ranked {
 /// BM25 index, built once per tree generation from prepared vectors.
 /// Only document frequency is (re)computed per generation; per-query work
 /// is scoring plus the bounded heap.
+///
+/// v1.2, fix 38: `df` is a flat Vec indexed by term id (the interner
+/// assigns dense ids), not a HashMap. Term lookup becomes a direct index.
 #[derive(Debug, Default)]
 pub struct Bm25Index {
-    df: HashMap<u32, u32>,
+    df: Vec<u32>,
     avgdl: f64,
     n: f64,
 }
@@ -431,15 +447,25 @@ impl Bm25Index {
     /// Build from the prepared token vectors of one generation.
     pub fn build(cands: &[Candidate]) -> Self {
         let n = cands.len().max(1) as f64;
-        let mut df: HashMap<u32, u32> = HashMap::new();
+        // Size the df vec to the max term id seen; interner ids are dense
+        // from 0, so this is exact (no over-allocation beyond one page).
+        let max_id = cands
+            .iter()
+            .flat_map(|c| c.prep.token_ids.iter())
+            .copied()
+            .max()
+            .unwrap_or(0) as usize;
+        let mut df = vec![0u32; max_id + 1];
         let mut total_len = 0usize;
         for c in cands {
             total_len += c.prep.token_ids.len();
             // Document frequency counts a term once per document.
-            let mut seen = HashSet::new();
-            for t in &c.prep.token_ids {
-                if seen.insert(t) {
-                    *df.entry(*t).or_insert(0) += 1;
+            // token_ids may contain duplicates; dedup via the sorted
+            // token_counts (term ids are unique there by construction).
+            for &(t, _) in &c.prep.token_counts {
+                let idx = t as usize;
+                if idx < df.len() {
+                    df[idx] += 1;
                 }
             }
         }
@@ -462,7 +488,7 @@ impl Bm25Index {
 
     /// Document frequency of a term (0 for unseen query terms).
     pub fn doc_freq(&self, term: u32) -> u32 {
-        self.df.get(&term).copied().unwrap_or(0)
+        self.df.get(term as usize).copied().unwrap_or(0)
     }
 
     /// BM25 IDF: ln(((n - df + 0.5) / (df + 0.5)) + 1). Always finite for
@@ -720,6 +746,17 @@ fn sigmoid(x: f64) -> f64 {
 /// sigmoid (p = 0.5), and the margin GATE, not the confidence value,
 /// decides whether a hit is taken. Only the temperature T is fit, by
 /// minimizing log-loss on natural calibration lists (margin, top1-correct).
+///
+/// v1.2, fix 4: PRE-FIT BEHAVIOR IS DELIBERATELY CONSERVATIVE. At the
+/// uncalibrated baseline (T = 1.0), sigmoid(margin) for margin in [0, 1]
+/// spans only [0.5, 0.731], so the CONFIDENCE_CAP (0.95) never binds
+/// before fitting. This is the safe direction: an uncalibrated resolver
+/// reports middling confidence instead of false certainty, and the margin
+/// gates (0.15/0.35) do the actual accept/reject work. `fit_temperature`
+/// is available for the mined corpus, but the corpus is not bundled with
+/// this crate, so production starts uncalibrated by design; wire
+/// `Calibrator { temperature: Calibrator::fit_temperature(&rows) }` at
+/// load once calibration rows exist.
 #[derive(Debug, Clone, Copy)]
 pub struct Calibrator {
     /// Fitted temperature; 1.0 is the uncalibrated baseline.
@@ -881,15 +918,25 @@ impl LinearRanker {
                 }
                 let mut probs = [0.0f64; 8];
                 self.softmax_scaled(&row.xs, n, &mut probs);
+                // v1.2, fix 10: accumulate the gradient over classes first,
+                // then apply ONE weight-decay step. The old code ran
+                // `w -= g*xv + lr*l2*w` inside the per-class loop, so the
+                // decay hit n (up to 8) times per row, on weights already
+                // updated by earlier classes in the same row.
+                let mut grad_acc = [0.0f32; 137];
+                let mut bias_grad = 0.0f32;
                 for (i, (prob, x)) in probs.iter().zip(row.xs.iter()).take(n).enumerate() {
                     let target = if i == row.correct { 1.0f64 } else { 0.0 };
-                    let grad = prob - target; // dL/dz_i
-                    let g = grad as f32 * lr;
-                    for (w, xv) in self.weights.iter_mut().zip(x.iter()) {
-                        *w -= g * xv + lr * l2 * *w;
+                    let g = (prob - target) as f32 * lr;
+                    for (ga, xv) in grad_acc.iter_mut().zip(x.iter()) {
+                        *ga += g * xv;
                     }
-                    self.bias -= g;
+                    bias_grad += g;
                 }
+                for (w, ga) in self.weights.iter_mut().zip(grad_acc.iter()) {
+                    *w -= ga + lr * l2 * *w;
+                }
+                self.bias -= bias_grad;
             }
         }
     }
@@ -966,10 +1013,13 @@ pub trait Rng01 {
 /// side), never on the node edge. Deterministic only under an explicit
 /// test seed; production draws from the trajectory RNG.
 pub fn interior_point(c: &Candidate, rng: &mut dyn Rng01) -> MainViewportCss {
-    let mx = c.w * 0.15;
-    let my = c.h * 0.15;
-    let iw = (c.w - 2.0 * mx).max(1.0);
-    let ih = (c.h - 2.0 * my).max(1.0);
+    // v1.2, fix 9: the old `(w - 2*0.15w).max(1.0)` forced a 1px inner
+    // width, so a 1px-wide box sampled up to x + 1.15, outside the box.
+    // Clamp the margin to half the side and allow a zero inner span.
+    let mx = (c.w * 0.15).min(c.w * 0.5);
+    let my = (c.h * 0.15).min(c.h * 0.5);
+    let iw = (c.w - 2.0 * mx).max(0.0);
+    let ih = (c.h - 2.0 * my).max(0.0);
     MainViewportCss(
         c.at.0 + mx + rng.uniform01() * iw,
         c.at.1 + my + rng.uniform01() * ih,
@@ -1276,7 +1326,8 @@ pub struct MinedRow {
 
 /// Append one labelled row (JSONL, one object per line). Creates the
 /// corpus directory when missing. Refuses rows whose schema version is
-/// not the frozen v1 (the corpus must never mix schemas silently).
+/// not the frozen v2 (v1.2: schema 2 = name+text; the corpus must never
+/// mix schemas silently).
 /// Returns the io error to the caller; mining must never panic the
 /// resolve path.
 pub fn mine_confirmed_row(row: &MinedRow) -> std::io::Result<()> {
@@ -1359,6 +1410,16 @@ pub struct ResolverEngine {
     /// Candidates skipped for corrupt geometry (non-finite coordinates or
     /// degenerate scale): counted loudly, never silently corrected.
     pub skipped_bad_coords: u64,
+    /// v1.2, fix 11: name -> candidate indices, maintained in parallel
+    /// with `candidates` (populated in `insert`, cleared in
+    /// `begin_generation`). Stage-0 exact match does an O(1) lookup
+    /// instead of a linear scan with string compares per resolve.
+    name_index: HashMap<Box<str>, Vec<usize>>,
+    /// v1.2, fix 25: the ranked top-k from the last resolve() call,
+    /// stashed so the engine can render the shortlist without re-running
+    /// BM25+sort+assemble (the old shortlist_text called natural_top_k,
+    /// duplicating the whole stage-1 pass).
+    last_ranked: Vec<Ranked>,
 }
 
 impl ResolverEngine {
@@ -1379,6 +1440,8 @@ impl ResolverEngine {
             ranker: LinearRanker::zero(),
             skipped_no_embedding: 0,
             skipped_bad_coords: 0,
+            name_index: HashMap::new(),
+            last_ranked: Vec::new(),
         }
     }
 
@@ -1386,14 +1449,29 @@ impl ResolverEngine {
     /// BM25 index; keeps the identity cache, calibrator, and ranker.
     /// Stale cache entries are evicted by generation on lookup; call
     /// `evict_stale` explicitly for memory hygiene after navigation.
+    ///
+    /// v1.2, fix 33: the embedding cache is capped here. It used to grow
+    /// without bound across generations (one entry per distinct
+    /// node-text ever seen).
     pub fn begin_generation(&mut self, generation: u64) {
         self.generation = generation;
         self.interner = StringInterner::new();
         self.candidates.clear();
         self.live_by_id.clear();
+        self.name_index.clear();
         self.index = None;
         self.skipped_no_embedding = 0;
         self.skipped_bad_coords = 0;
+        // Cap the embedding cache: evict oldest-inserted entries beyond
+        // the cap. The cache is keyed by (backend_node_id, text_hash);
+        // entries from older generations are the least likely to hit.
+        if self.emb_cache.len() > EMB_CACHE_CAP {
+            // HashMap has no insertion order; drain-and-keep is O(n) but
+            // runs only when the cap is exceeded (amortized cheap).
+            let keep: HashMap<(u64, u64), [f32; 64]> =
+                self.emb_cache.drain().take(EMB_CACHE_CAP).collect();
+            self.emb_cache = keep;
+        }
     }
 
     /// Insert one raw node. `doc_xy` is the box top-left in the owning
@@ -1424,6 +1502,12 @@ impl ResolverEngine {
             enabled_visible,
             chain,
         )?;
+        // v1.2, fix 11: keep the name index in parallel with candidates.
+        let idx = self.candidates.len();
+        self.name_index
+            .entry(c.prep.name_norm.clone())
+            .or_default()
+            .push(idx);
         self.candidates.push(c);
         Ok(backend_node_id)
     }
@@ -1458,6 +1542,13 @@ impl ResolverEngine {
         self.index.as_ref()
     }
 
+    /// The ranked top-k from the last resolve() call (v1.2, fix 25).
+    /// The engine renders the escalation shortlist from this instead of
+    /// re-running the BM25 pass.
+    pub fn last_ranked(&self) -> &[Ranked] {
+        &self.last_ranked
+    }
+
     /// Borrow the identity cache mutably (commit after Confirmed).
     pub fn cache_mut(&mut self) -> &mut IdentityCache {
         &mut self.cache
@@ -1476,24 +1567,31 @@ impl ResolverEngine {
     /// passed in is the stage-1 score for this candidate.
     fn featurize(
         &self,
-        desc_norm: &str,
+        query: &features::QuerySide,
         query_token_ids: &HashSet<u32>,
         cand: &Candidate,
         bm25: f64,
     ) -> [f32; 137] {
-        let inp = FeatureInputs {
+        // v1.2, fix 5 (schema v2): the candidate side is name + visible
+        // text, matching what stage-1 BM25 and the cached embedding
+        // already score. v1.2, fix 29: the query side is precomputed once
+        // per resolve(); the candidate embedding comes from emb_cache
+        // (no recompute).
+        let cand_text = format!("{} {}", cand.prep.name_norm, cand.prep.text_norm);
+        let cand_emb = cand.prep.embedding.unwrap_or([0.0f32; 64]);
+        features::assemble_fast(
             bm25,
-            description: desc_norm,
-            candidate_text: &cand.prep.name_norm,
-            role_intent_match: cand.prep.role_intent_flag(query_token_ids),
-            exact_name: cand.prep.exact_name_flag(desc_norm),
-            candidate_w: cand.w,
-            candidate_h: cand.h,
-            candidate_center: cand.center(),
-            viewport: self.cfg.viewport,
-            enabled_visible: cand.prep.enabled_visible,
-        };
-        features::assemble(&inp)
+            query,
+            &cand_text,
+            &cand_emb,
+            cand.prep.role_intent_flag(query_token_ids),
+            cand.prep.exact_name_flag(&query.norm),
+            cand.w,
+            cand.h,
+            cand.center(),
+            self.cfg.viewport,
+            cand.prep.enabled_visible,
+        )
     }
 
     /// The natural top-k BM25 list for a description, with features.
@@ -1518,10 +1616,12 @@ impl ResolverEngine {
         let (ranked, skipped) = index.top_k(&self.candidates, &qterms, k);
         self.skipped_no_embedding += skipped.len() as u64;
         let qset: HashSet<u32> = qterms.iter().copied().collect();
+        // v1.2, fix 29: precompute the query side once, not per candidate.
+        let query = features::precompute_query(&desc_norm);
         let mut out = Vec::with_capacity(ranked.len());
         for r in ranked {
             let c = &self.candidates[r.idx];
-            let fv = self.featurize(&desc_norm, &qset, c, r.score);
+            let fv = self.featurize(&query, &qset, c, r.score);
             out.push((r.idx, r.score, fv));
         }
         Ok(out)
@@ -1572,7 +1672,14 @@ impl ResolverEngine {
 
         // Stage 0: exact accessible-name match. Early exit ONLY when the
         // match is unique, visible, enabled, and current-generation.
-        let (outcome, unique_idx) = exact_match_scan(&self.candidates, &desc_norm);
+        // v1.2, fix 11: O(1) lookup on the per-generation name index.
+        // Same semantics as exact_match_scan: unique -> index, multiple
+        // -> Ambiguous, absent -> None.
+        let (outcome, unique_idx) = match self.name_index.get(desc_norm.as_str()) {
+            None => (ExactOutcome::None, None),
+            Some(v) if v.len() > 1 => (ExactOutcome::Ambiguous, None),
+            Some(v) => (ExactOutcome::Unique, Some(v[0])),
+        };
         if outcome == ExactOutcome::Unique {
             let i = unique_idx.expect("unique exact match carries its index");
             let c = &self.candidates[i];
@@ -1595,6 +1702,9 @@ impl ResolverEngine {
             .get_or_insert_with(|| Bm25Index::build(&self.candidates));
         let (ranked, skipped) = index.top_k(&self.candidates, &qterms, TOP_K);
         self.skipped_no_embedding += skipped.len() as u64;
+        // v1.2, fix 25: stash for the shortlist; the engine must not
+        // re-run the BM25 pass.
+        self.last_ranked = ranked.clone();
         if ranked.is_empty() {
             return Resolution::Miss {
                 reason: MissReason::RankingUncertain,
@@ -1602,9 +1712,27 @@ impl ResolverEngine {
             };
         }
         let top1 = ranked[0].score;
-        let top2 = ranked.get(1).map(|r| r.score).unwrap_or(0.0);
+        // v1.2, fix 4: a lone candidate used to get margin 1.0 and share
+        // 1.0 (top2 defaulted to 0.0), always passing the gates. Require
+        // at least two scored rows for the margin/share gates, plus an
+        // absolute score floor so a lone weak candidate escalates.
+        if ranked.len() < 2 {
+            return Resolution::Miss {
+                reason: MissReason::RankingUncertain,
+                candidates: ranked,
+            };
+        }
+        let top2 = ranked[1].score;
         let mass: f64 = ranked.iter().map(|r| r.score).sum();
         if !mass.is_finite() || mass <= 0.0 {
+            return Resolution::Miss {
+                reason: MissReason::RankingUncertain,
+                candidates: ranked,
+            };
+        }
+        // Absolute floor: a top score below this never passes, even with
+        // a perfect margin (guards degenerate single-term matches).
+        if top1 < BM25_SCORE_FLOOR {
             return Resolution::Miss {
                 reason: MissReason::RankingUncertain,
                 candidates: ranked,
@@ -1632,9 +1760,11 @@ impl ResolverEngine {
         // Stage 2: interim linear ranker over the live top-k.
         let n = ranked.len().min(TOP_K);
         let mut xs = [[0.0f32; 137]; TOP_K];
+        // v1.2, fix 29: precompute the query side once, not per candidate.
+        let query = features::precompute_query(&desc_norm);
         for (k, r) in ranked.iter().take(n).enumerate() {
             let c = &self.candidates[r.idx];
-            xs[k] = self.featurize(&desc_norm, &qset, c, r.score);
+            xs[k] = self.featurize(&query, &qset, c, r.score);
         }
         let mut probs = [0.0f64; 8];
         self.ranker.softmax_scaled(&xs, n, &mut probs);
@@ -1838,6 +1968,7 @@ mod tests {
                 h: 10.0,
                 dpr: 1.0,
                 prep: PreparedNode {
+                    text_norm: String::new().into(),
                     backend_node_id: 1,
                     generation: 1,
                     name_norm: "".into(),
@@ -1901,6 +2032,7 @@ mod tests {
                     h: 10.0,
                     dpr: 1.0,
                     prep: PreparedNode {
+                        text_norm: String::new().into(),
                         backend_node_id: 0,
                         generation: 1,
                         name_norm: "".into(),
@@ -1961,6 +2093,7 @@ mod tests {
             h: 10.0,
             dpr: 1.0,
             prep: PreparedNode {
+                text_norm: String::new().into(),
                 backend_node_id: 1,
                 generation: 1,
                 name_norm: "".into(),
@@ -2106,6 +2239,22 @@ mod tests {
         let (o, i) = exact_match_scan(e2.candidates(), "search");
         assert_eq!(o, ExactOutcome::Ambiguous);
         assert_eq!(i, None);
+    }
+
+    #[test]
+    fn name_index_matches_scan_semantics() {
+        // v1.2, fix 11: the per-generation name index must agree with
+        // exact_match_scan on Unique/Ambiguous/None, and resolve() must
+        // take the indexed path to the same hit.
+        let e = engine_from_names(&[("button", "Search"), ("link", "Home")]);
+        assert_eq!(e.name_index.get("search").map(|v| v.len()), Some(1));
+        assert_eq!(e.name_index.get("missing"), None);
+        let e2 = engine_from_names(&[("button", "Search"), ("button", "Search")]);
+        assert_eq!(e2.name_index.get("search").map(|v| v.len()), Some(2));
+        // A fresh generation clears the index.
+        let mut e3 = engine_from_names(&[("button", "Search")]);
+        e3.begin_generation(2);
+        assert!(e3.name_index.is_empty());
     }
 
     // -- identity cache ----------------------------------------------------------
@@ -2361,6 +2510,23 @@ mod tests {
         assert!((c.p(0.0) - 0.5).abs() < 1e-12);
     }
 
+    #[test]
+    fn uncalibrated_confidence_range_is_conservative() {
+        // v1.2, fix 4: pins the documented pre-fit behavior. At T = 1 the
+        // sigmoid over margin [0, 1] spans [0.5, ~0.731], so the 0.95
+        // confidence cap never binds before fitting. This is the safe
+        // direction (no false certainty); the margin gates decide.
+        let c = Calibrator::uncalibrated();
+        assert!((c.p(0.0) - 0.5).abs() < 1e-12);
+        let p1 = c.p(1.0);
+        assert!((p1 - 0.7310585786300049).abs() < 1e-9, "p(1.0) = {p1}");
+        assert!(p1 < 0.95, "0.95 cap must not bind pre-fit");
+        // And the fit path can actually reach the cap on real rows.
+        let rows: Vec<(f64, bool)> = (0..50).map(|i| (i as f64 / 50.0, i % 2 == 0)).collect();
+        let t = Calibrator::fit_temperature(&rows);
+        assert!(t > 0.0 && t.is_finite());
+    }
+
     // -- grounding ---------------------------------------------------------------
 
     #[test]
@@ -2468,7 +2634,8 @@ mod tests {
         assert_eq!(text.lines().count(), 2);
         let v: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(v["description"], "search");
-        assert_eq!(v["schema"], 1);
+        // v1.2: schema is now 2 (name+text).
+        assert_eq!(v["schema"], 2);
         // The path is outside the repo working copy.
         assert!(!path.to_string_lossy().contains("chromebook-vm-bridge"));
         std::env::remove_var(CORPUS_DIR_ENV);

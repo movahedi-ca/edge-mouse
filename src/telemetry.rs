@@ -13,6 +13,7 @@ pub enum Stage {
     Perceive,
     Normalize,
     Cache,
+    Exact,
     Bm25,
     Ranker,
     Convert,
@@ -24,7 +25,7 @@ pub enum Stage {
 
 impl Stage {
     /// Number of stages; also the timer slot count.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
 
     const fn index(self) -> usize {
         self as usize

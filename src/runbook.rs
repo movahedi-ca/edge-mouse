@@ -194,7 +194,10 @@ pub struct RunJournal {
     /// "dispatched:step{i}:attempt{k}" before the action;
     /// "emit_confirmed:step{i}:attempt{k}" immediately after the X11 emit
     /// returns (before verify);
-    /// "confirmed:step{i}" / "unconfirmed:step{i}:{verdict}" after;
+    /// "confirmed:step{i}" / "confirmed:step{i}:attempt{k}" /
+    /// "confirmed:step{i}:already-satisfied" (pre-dispatch predicate true,
+    /// NO action taken) / "confirmed:step{i}:reconciled" (restart) /
+    /// "unconfirmed:step{i}:{verdict}" after;
     /// "escalated:..." / "parked:..." / "checkpoint:..." at stops.
     pub last_outcome: Option<String>,
     pub profile_id: String,
@@ -203,6 +206,12 @@ pub struct RunJournal {
     /// Steps whose actions are confirmed done: never re-executed.
     pub committed_steps: Vec<usize>,
     pub checkpoints: Vec<usize>,
+    /// v1.2, fix 1: guardrail counters persisted across restarts. A crash
+    /// loop must not re-earn the escalation budget or reset the 2-strike
+    /// breaker. `strikes_on` is the step index of the last escalation
+    /// (None = no live strike).
+    pub tier1_calls: u64,
+    pub strikes_on: Option<usize>,
 }
 
 pub trait JournalStore {
@@ -222,6 +231,8 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS run_journal (
     tree_generation INTEGER NOT NULL,
     committed_steps TEXT NOT NULL,
     checkpoints TEXT NOT NULL,
+    tier1_calls INTEGER NOT NULL DEFAULT 0,
+    strikes_on INTEGER,
     updated_at INTEGER NOT NULL
 )";
 
@@ -233,12 +244,17 @@ pub struct SqliteJournalStore {
 impl SqliteJournalStore {
     pub fn open(path: &str) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
+        // v1.2, fix 3: WAL mode so journal persists don't block readers;
+        // the write-before-action guarantee is unchanged (each save still
+        // completes before the runner proceeds).
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
@@ -250,13 +266,15 @@ impl JournalStore for SqliteJournalStore {
             .conn
             .prepare(
                 "SELECT run_id, cursor, last_outcome, profile_id, origin,
-                        tree_generation, committed_steps, checkpoints
+                        tree_generation, committed_steps, checkpoints,
+                        tier1_calls, strikes_on
                  FROM run_journal WHERE book_hash = ?1",
             )
             .ok()?;
         stmt.query_row([book_hash], |row| {
             let committed: String = row.get(6)?;
             let checkpoints: String = row.get(7)?;
+            let strikes_on: Option<i64> = row.get(9)?;
             Ok(RunJournal {
                 book_hash: book_hash.to_string(),
                 run_id: row.get(0)?,
@@ -267,6 +285,8 @@ impl JournalStore for SqliteJournalStore {
                 tree_generation: row.get::<_, i64>(5)? as u64,
                 committed_steps: serde_json::from_str(&committed).unwrap_or_default(),
                 checkpoints: serde_json::from_str(&checkpoints).unwrap_or_default(),
+                tier1_calls: row.get::<_, i64>(8).unwrap_or(0).max(0) as u64,
+                strikes_on: strikes_on.and_then(|s| usize::try_from(s).ok()),
             })
         })
         .ok()
@@ -277,33 +297,42 @@ impl JournalStore for SqliteJournalStore {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        self.conn
-            .execute(
+        // v1.2, fix 3: prepare_cached keeps one prepared statement on the
+        // connection instead of re-preparing per persist.
+        let mut stmt = self
+            .conn
+            .prepare_cached(
                 "INSERT INTO run_journal
                      (book_hash, run_id, cursor, last_outcome, profile_id, origin,
-                      tree_generation, committed_steps, checkpoints, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                      tree_generation, committed_steps, checkpoints,
+                      tier1_calls, strikes_on, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
                  ON CONFLICT(book_hash) DO UPDATE SET
                      run_id=excluded.run_id, cursor=excluded.cursor,
                      last_outcome=excluded.last_outcome, profile_id=excluded.profile_id,
                      origin=excluded.origin, tree_generation=excluded.tree_generation,
                      committed_steps=excluded.committed_steps,
-                     checkpoints=excluded.checkpoints, updated_at=excluded.updated_at",
-                params![
-                    j.book_hash,
-                    j.run_id,
-                    j.cursor as i64,
-                    j.last_outcome,
-                    j.profile_id,
-                    j.origin,
-                    j.tree_generation as i64,
-                    serde_json::to_string(&j.committed_steps).unwrap_or_else(|_| "[]".to_string()),
-                    serde_json::to_string(&j.checkpoints).unwrap_or_else(|_| "[]".to_string()),
-                    now,
-                ],
+                     checkpoints=excluded.checkpoints,
+                     tier1_calls=excluded.tier1_calls,
+                     strikes_on=excluded.strikes_on, updated_at=excluded.updated_at",
             )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        stmt.execute(params![
+            j.book_hash,
+            j.run_id,
+            j.cursor as i64,
+            j.last_outcome,
+            j.profile_id,
+            j.origin,
+            j.tree_generation as i64,
+            serde_json::to_string(&j.committed_steps).unwrap_or_else(|_| "[]".to_string()),
+            serde_json::to_string(&j.checkpoints).unwrap_or_else(|_| "[]".to_string()),
+            j.tier1_calls as i64,
+            j.strikes_on.map(|s| s as i64),
+            now,
+        ])
+        .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -335,6 +364,10 @@ pub trait StepDriver {
     /// Record a failed target id; the retry must exclude it. Inserted
     /// BEFORE any escalate carrying failed ids.
     fn note_failed(&mut self, id: u64);
+    /// v1.2, fix 19: record that a retry (attempt 1) is starting, so
+    /// TaskReport.retries reflects reality. The old code had inc_retries
+    /// with no production caller.
+    fn note_retry(&mut self);
     /// One redacted WebP screenshot for the escalation context ring. The
     /// driver MUST zero password fields before compression.
     fn escalation_shot(&mut self) -> Option<Vec<u8>>;
@@ -411,11 +444,14 @@ pub fn run(
 ) -> (RunState, RunOutcome) {
     let hash = book_hash(book);
     // H17: resume a persisted journal for the same book and profile, if any.
+    // v1.2, fix 1: the guardrail counters come back from the journal too;
+    // a crash loop must not re-earn the escalation budget or clear the
+    // 2-strike breaker.
     let mut state = match store.load(&hash) {
         Some(j) if j.profile_id == cfg.profile_id => RunState {
+            tier1_calls: j.tier1_calls as usize,
+            strikes_on: j.strikes_on,
             journal: j,
-            tier1_calls: 0,
-            strikes_on: None,
             shot_ring: VecDeque::new(),
         },
         _ => RunState {
@@ -429,6 +465,8 @@ pub fn run(
                 tree_generation: 0,
                 committed_steps: Vec::new(),
                 checkpoints: Vec::new(),
+                tier1_calls: 0,
+                strikes_on: None,
             },
             tier1_calls: 0,
             strikes_on: None,
@@ -470,7 +508,34 @@ fn persist(state: &RunState, store: &mut dyn JournalStore) -> Result<(), String>
 }
 
 fn allowlisted(value: &str, list: &[String]) -> bool {
-    list.iter().any(|entry| value.contains(entry))
+    // v1.2, fix 1: the old substring match let "portal.example.evil.com"
+    // pass an allowlist containing "example.com". For domains: exact match
+    // or dotted-suffix (subdomain with dot boundary). Empty entries never
+    // match.
+    list.iter().any(|entry| {
+        if entry.is_empty() {
+            return false;
+        }
+        value == entry.as_str()
+            || value
+                .strip_suffix(entry.as_str())
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+/// Window-title allowlist: exact match or starts-with followed by a
+/// separator (non-alphanumeric). "Chrome - Portal" matches "Chrome";
+/// "Chromebook" does not.
+fn window_allowlisted(value: &str, list: &[String]) -> bool {
+    list.iter().any(|entry| {
+        if entry.is_empty() {
+            return false;
+        }
+        value == entry.as_str()
+            || value
+                .strip_prefix(entry.as_str())
+                .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric()))
+    })
 }
 
 /// Hard allowlist gate. Returns the violation reason, if any. A step
@@ -482,13 +547,15 @@ fn allowlist_violation(
     live_window: &str,
     live_domain: &str,
 ) -> Option<String> {
-    if !step.window.is_empty() && !allowlisted(&step.window, &ctx.cfg.window_allowlist) {
+    // v1.2, fix 1: window titles use starts-with-separator matching;
+    // domains use exact/dotted-suffix.
+    if !step.window.is_empty() && !window_allowlisted(&step.window, &ctx.cfg.window_allowlist) {
         return Some(format!("step window {:?} outside allowlist", step.window));
     }
     if !step.domain.is_empty() && !allowlisted(&step.domain, &ctx.cfg.domain_allowlist) {
         return Some(format!("step domain {:?} outside allowlist", step.domain));
     }
-    if !live_window.is_empty() && !allowlisted(live_window, &ctx.cfg.window_allowlist) {
+    if !live_window.is_empty() && !window_allowlisted(live_window, &ctx.cfg.window_allowlist) {
         return Some(format!("live window {live_window:?} outside allowlist"));
     }
     if !live_domain.is_empty() && !allowlisted(live_domain, &ctx.cfg.domain_allowlist) {
@@ -532,6 +599,11 @@ fn dispatched_unemitted_marker(last_outcome: &Option<String>, i: usize) -> bool 
 
 enum StepResult {
     Done,
+    /// v1.2, fix 2: the pre-dispatch predicate was already true, so no
+    /// action was ever taken for this step. Journaled distinctly from
+    /// `Done` (which means dispatched and verified) so the durable trace
+    /// can tell "nothing happened" apart from "the click landed".
+    AlreadySatisfied,
     Escalate {
         reason: EscalateReason,
         evidence: String,
@@ -553,6 +625,8 @@ fn mark_done(
     }
     state.journal.cursor += 1;
     state.strikes_on = None;
+    // v1.2, fix 1: keep the durable strike state in sync.
+    state.journal.strikes_on = None;
     state.journal.last_outcome = Some(outcome);
     persist(state, store)
 }
@@ -674,6 +748,16 @@ fn drive(
                     return RunOutcome::Parked { reason: e };
                 }
             }
+            StepResult::AlreadySatisfied => {
+                if let Err(e) = mark_done(
+                    state,
+                    store,
+                    i,
+                    format!("confirmed:step{i}:already-satisfied"),
+                ) {
+                    return RunOutcome::Parked { reason: e };
+                }
+            }
             StepResult::Escalate {
                 reason,
                 evidence,
@@ -710,8 +794,10 @@ fn execute_step(
     store: &mut dyn JournalStore,
 ) -> StepResult {
     // AlreadySatisfied before any dispatch: a satisfied step is never clicked.
+    // v1.2, fix 2: this returns a distinct variant so the journal records
+    // that NO action was taken (vs. dispatched-and-verified).
     if driver.predicate_now(&step.predicate).is_true() {
-        return StepResult::Done;
+        return StepResult::AlreadySatisfied;
     }
     let mut failed_ids: Vec<u64> = Vec::new();
 
@@ -782,6 +868,8 @@ fn execute_step(
             if driver.predicate_now(&step.predicate).is_true() {
                 return StepResult::Done;
             }
+            // v1.2, fix 19: record the retry for telemetry.
+            driver.note_retry();
             state.journal.last_outcome = Some(format!("dispatched:step{i}:attempt1"));
             if let Err(e) = persist(state, store) {
                 return StepResult::Park { reason: e };
@@ -870,6 +958,10 @@ fn escalate(
     }
     state.tier1_calls += 1;
     state.strikes_on = Some(i);
+    // v1.2, fix 1: the journal carries the guardrail counters so a
+    // restart restores them; keep the durable copy in sync here.
+    state.journal.tier1_calls = state.tier1_calls as u64;
+    state.journal.strikes_on = state.strikes_on;
     state.journal.last_outcome = Some(format!("escalated:step{i}:{reason:?}"));
     let _ = persist(state, store);
 
@@ -949,6 +1041,10 @@ mod tests {
         fn note_failed(&mut self, id: u64) {
             self.failed.push(id);
         }
+        fn note_retry(&mut self) {
+            // Test stub: no-op (retry counting is telemetry's job in
+            // production; the ScriptDriver tracks dispatches instead).
+        }
         fn escalation_shot(&mut self) -> Option<Vec<u8>> {
             self.shots.pop_front()
         }
@@ -1016,6 +1112,8 @@ mod tests {
             tree_generation: 0,
             committed_steps: Vec::new(),
             checkpoints: Vec::new(),
+            tier1_calls: 0,
+            strikes_on: None,
         };
         f(&mut j);
         store.save(&j).unwrap();
@@ -1081,6 +1179,8 @@ mod tests {
             tree_generation: 9,
             committed_steps: vec![0, 1, 2],
             checkpoints: vec![2],
+            tier1_calls: 7,
+            strikes_on: Some(2),
         };
         store.save(&j).unwrap();
         let back = store.load("h1").unwrap();
@@ -1091,7 +1191,25 @@ mod tests {
         assert_eq!(back.tree_generation, 9);
         assert_eq!(back.committed_steps, vec![0, 1, 2]);
         assert_eq!(back.checkpoints, vec![2]);
+        // v1.2, fix 1: guardrail counters round-trip through SQLite.
+        assert_eq!(back.tier1_calls, 7);
+        assert_eq!(back.strikes_on, Some(2));
         assert!(store.load("nope").is_none());
+    }
+
+    #[test]
+    fn sqlite_journal_uses_wal_mode() {
+        // v1.2, fix 3: file-backed journals run in WAL mode.
+        let dir = std::env::temp_dir().join("edge-mouse-wal-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("wal.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteJournalStore::open(path.to_str().unwrap()).unwrap();
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
     }
 
     // --- happy path + no double-execute ---
@@ -1338,6 +1456,8 @@ mod tests {
                 tree_generation: 0,
                 committed_steps: Vec::new(),
                 checkpoints: Vec::new(),
+                tier1_calls: 0,
+                strikes_on: None,
             },
             tier1_calls: 0,
             strikes_on: None,
@@ -1354,6 +1474,66 @@ mod tests {
                 "confirmed:step0:attempt0",
             ]
         );
+    }
+
+    #[test]
+    fn restart_restores_escalation_budget_and_strikes() {
+        // v1.2, fix 1: a crash loop must not re-earn the escalation budget
+        // or clear the 2-strike breaker. Seed a journal mid-run with a
+        // spent escalation and a live strike, then run() (the restart
+        // entry point). Budget for a 3-step book is 2.
+        let book = vec![step("s0"), step("s1"), step("s2")];
+        let mut store = MemStore::new();
+        let j = RunJournal {
+            run_id: "seeded".to_string(),
+            book_hash: book_hash(&book),
+            cursor: 1,
+            last_outcome: Some("escalated:step0:VerifyFailed".to_string()),
+            profile_id: "p".to_string(),
+            origin: String::new(),
+            tree_generation: 0,
+            committed_steps: Vec::new(),
+            checkpoints: Vec::new(),
+            tier1_calls: 1,
+            strikes_on: Some(0),
+        };
+        store.save(&j).unwrap();
+        let mut driver = ScriptDriver::new();
+        // Step 1 dispatches fine and verifies Unchanged twice -> escalates.
+        driver.verify_values.push_back(Verdict::Unchanged);
+        driver.verify_values.push_back(Verdict::Unchanged);
+        let cfg = cfg();
+        let (state, _outcome) = run(&book, &cfg, &mut driver, &mut store);
+        // The restored counter (1) plus the new escalation (1) = 2.
+        // Without the fix, the counter would restart at 0 and read 1.
+        assert_eq!(state.tier1_calls, 2);
+        assert_eq!(state.journal.tier1_calls, 2);
+        // Step 1 escalated instead of completing, so the strike moved
+        // from step 0 to step 1 (not cleared, not reset to None).
+        assert_eq!(state.strikes_on, Some(1));
+        assert_eq!(state.journal.strikes_on, Some(1));
+    }
+
+    #[test]
+    fn already_satisfied_journals_distinctly_from_dispatched() {
+        // v1.2, fix 2: a step whose pre-dispatch predicate is already true
+        // must journal "confirmed:step{i}:already-satisfied", NOT the bare
+        // "confirmed:step{i}" that means dispatched-and-verified.
+        let book = vec![step("s0")];
+        let mut store = MemStore::new();
+        let mut driver = ScriptDriver::new();
+        driver
+            .predicate_values
+            .push_back(PredicateValue::Bool(true));
+        let cfg = cfg();
+        let (state, outcome) = run(&book, &cfg, &mut driver, &mut store);
+        assert!(matches!(outcome, RunOutcome::Complete));
+        assert!(driver.dispatches.is_empty(), "no action must be taken");
+        assert_eq!(
+            state.journal.last_outcome.as_deref(),
+            Some("confirmed:step0:already-satisfied")
+        );
+        assert_eq!(state.journal.committed_steps, vec![0]);
     }
 
     #[test]

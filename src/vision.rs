@@ -85,20 +85,29 @@ pub fn box_filter_9x8(c: &Capture) -> Result<[[u32; 9]; 8]> {
             let x1 = ((col + 1) * w) / 9;
             let y0 = (row * h) / 8;
             let y1 = ((row + 1) * h) / 8;
+            let x1e = x1.max(x0 + 1);
+            let y1e = y1.max(y0 + 1);
+            // v1.2, fix 5: the per-pixel bounds check was provably
+            // redundant (validate_capture guarantees the buffer covers
+            // stride*(h-1) + w*4 bytes, and every (x, y) here is inside
+            // [0, w) x [0, h)). One check per cell; the inner loop runs
+            // over slices so LLVM can vectorize the luma accumulation.
+            ensure!(
+                (y1e - 1) * c.stride + (x1e - 1) * 4 + 2 < c.buf.len(),
+                "vision: cell ({row},{col}) out of bounds"
+            );
             let (mut acc, mut n) = (0u64, 0u64);
-            for y in y0..y1.max(y0 + 1) {
-                for x in x0..x1.max(x0 + 1) {
-                    let idx = y * c.stride + x * 4;
-                    ensure!(
-                        idx + 2 < c.buf.len(),
-                        "vision: pixel ({x},{y}) out of bounds"
-                    );
-                    // X11 pixels are BGRX: 29*B + 150*G + 77*R.
-                    acc += 29 * c.buf[idx] as u64
-                        + 150 * c.buf[idx + 1] as u64
-                        + 77 * c.buf[idx + 2] as u64;
-                    n += 1;
-                }
+            for y in y0..y1e {
+                let row_start = y * c.stride;
+                let row_px = &c.buf[row_start + x0 * 4..row_start + x1e * 4];
+                // X11 pixels are BGRX: 29*B + 150*G + 77*R.
+                acc += row_px
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| 29 * p[0] as u64 + 150 * p[1] as u64 + 77 * p[2] as u64)
+                    .sum::<u64>();
+                n += (x1e - x0) as u64;
             }
             *cell = (acc / n.max(1)) as u32 >> 8;
         }
@@ -130,6 +139,24 @@ pub fn dhash_9x8(cells: &[[u32; 9]; 8]) -> u64 {
 pub fn hash_distance(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
 }
+
+/// Mean luma of the 9x8 grid (v1.2, fix 16). dHash is blind to uniform
+/// color changes (a white->black flip has Hamming distance 0); the mean
+/// luma is level-sensitive and catches them. The two hashes are
+/// complementary: dHash for structure, luma for level.
+pub fn mean_luma_9x8(cells: &[[u32; 9]; 8]) -> f32 {
+    let mut sum = 0u64;
+    for row in cells.iter() {
+        for &c in row.iter() {
+            sum += c as u64;
+        }
+    }
+    sum as f32 / 72.0
+}
+
+/// Luma difference threshold: a mean-luma shift above this counts as a
+/// level change even when the dHash distance is 0 (uniform region).
+pub const LUMA_CUTOFF: f32 = 12.0;
 
 // ---------------------------------------------------------------------------
 // Verdicts, evidence, stats.
@@ -439,10 +466,17 @@ pub const SETTLED_CUTOFF: u32 = 4;
 /// Predicate value plus region pixels captured during the hover dwell,
 /// BEFORE the press. If the predicate is already true here, the runner
 /// must NOT click again.
+///
+/// v1.2, fix 16 (also resolves M6): the region hash AND mean luma are
+/// the PRE-ACTION anchor, captured in dispatch before the click. The old
+/// code hashed a post-action frame and diffed two post-action frames.
+/// `region_luma` is the level-sensitive complement to the dHash (which
+/// is blind to uniform color changes).
 pub struct Baseline {
     pub predicate_before: PredicateValue,
     pub region: (u32, u32, u32, u32),
     pub region_hash: u64,
+    pub region_luma: f32,
 }
 
 /// Capture the baseline during the hover dwell. When the predicate is
@@ -455,16 +489,18 @@ pub fn capture_baseline(
     capture: &dyn Fn((u32, u32, u32, u32)) -> Result<Capture>,
 ) -> Result<Baseline> {
     let predicate_before = eval(pred);
-    let region_hash = if predicate_before.is_true() {
-        0
+    let (region_hash, region_luma) = if predicate_before.is_true() {
+        (0, 0.0)
     } else {
         let c = capture(region)?;
-        dhash_9x8(&box_filter_9x8(&c)?)
+        let cells = box_filter_9x8(&c)?;
+        (dhash_9x8(&cells), mean_luma_9x8(&cells))
     };
     Ok(Baseline {
         predicate_before,
         region,
         region_hash,
+        region_luma,
     })
 }
 
@@ -521,15 +557,25 @@ pub fn check_against(
         finish!(Verdict::Confirmed, None, None);
     }
     // Predicate false or unknown: consult region pixels as supporting signal.
-    let frame1 = match capture(baseline.region)
+    // v1.2, fix 16: compare against the PRE-ACTION baseline (dHash for
+    // structure, mean luma for level). A uniform white->black flip has
+    // dHash distance 0 but a large luma shift. The luma check ONLY applies
+    // when the baseline dHash is 0 (uniform region); for structured
+    // regions, dHash alone decides (a focus ring changes luma but is
+    // still "unchanged" if the dHash is stable).
+    let (frame1_hash, frame1_luma) = match capture(baseline.region)
         .and_then(|c| box_filter_9x8(&c))
-        .map(|cells| dhash_9x8(&cells))
+        .map(|cells| (dhash_9x8(&cells), mean_luma_9x8(&cells)))
     {
         Ok(h) => h,
         Err(_) => finish!(Verdict::Inconclusive, None, None),
     };
-    let dist = hash_distance(baseline.region_hash, frame1);
-    if dist < STABLE_CUTOFF {
+    let dist = hash_distance(baseline.region_hash, frame1_hash);
+    // Uniform baseline (dHash=0): luma is the level signal.
+    // Structured baseline: dHash distance decides.
+    let level_changed =
+        baseline.region_hash == 0 && (baseline.region_luma - frame1_luma).abs() >= LUMA_CUTOFF;
+    if dist < STABLE_CUTOFF && !level_changed {
         // Stable and matching the baseline, predicate false -> Unchanged.
         finish!(Verdict::Unchanged, None, Some(dist));
     }
@@ -552,15 +598,30 @@ pub fn check_against(
         Ok(h) => h,
         Err(_) => finish!(Verdict::Inconclusive, Some(s), Some(dist)),
     };
-    if hash_distance(frame1, frame2) > SETTLED_CUTOFF {
+    if hash_distance(frame1_hash, frame2) > SETTLED_CUTOFF {
         // Still moving after the settle window: animation, not the action.
         finish!(Verdict::Inconclusive, Some(s), Some(dist));
     }
     // One more predicate read after the settle, then OCR as a last resort
     // for text predicates.
+    //
+    // v1.2, fix 13: a false HasText on a non-empty tree routes through
+    // the OCR path instead of verdicting Unchanged directly. The old
+    // code sent Bool(false) straight to Unchanged, so OCR never ran for
+    // HasText (eval never returns Text, and the OCR arm only ran on
+    // Unknown/Text).
     let verdict = match eval(pred) {
         PredicateValue::Bool(true) => Verdict::Confirmed,
-        PredicateValue::Bool(false) => Verdict::Unchanged,
+        PredicateValue::Bool(false) => match pred {
+            Predicate::HasText(want) => match ocr(baseline.region) {
+                OcrOutcome::Text(seen) if seen.contains(want.as_str()) => Verdict::Confirmed,
+                OcrOutcome::Text(_) => Verdict::Unchanged,
+                OcrOutcome::Timeout | OcrOutcome::Busy | OcrOutcome::Error(_) => {
+                    Verdict::Inconclusive
+                }
+            },
+            _ => Verdict::Unchanged,
+        },
         // Unknown, or a text value the verifier cannot interpret as
         // satisfied: fall through to the OCR last-resort below.
         PredicateValue::Unknown | PredicateValue::Text(_) => match pred {
@@ -681,10 +742,14 @@ mod tests {
     }
 
     fn baseline_with_hash(hash: u64) -> Baseline {
+        // Test helper: the baseline luma must match the solid(90,80,10)
+        // used at call sites (luma 10.0), not an arbitrary 128.0, or the
+        // v1.2 fix-16 luma check sees a phantom level change.
         Baseline {
             predicate_before: PredicateValue::Bool(false),
             region: (0, 0, 90, 80),
             region_hash: hash,
+            region_luma: 10.0,
         }
     }
 
@@ -883,9 +948,12 @@ mod tests {
     fn scenario_focus_ring_change_is_unchanged() {
         // Focus ring appeared: pixels changed once, then stable, predicate
         // false. Unchanged, never Confirmed.
+        // v1.2, fix 13: uses a non-text predicate (Focused) because HasText
+        // now routes through OCR; with Busy OCR a false HasText is
+        // Inconclusive, not Unchanged.
         let base = baseline_with_hash(hash_of(&solid(90, 80, 10)));
         let (ev, stats, _) = run_verify(
-            &done_pred(),
+            &Predicate::Focused,
             &base,
             vec![PredicateValue::Bool(false), PredicateValue::Bool(false)],
             vec![block_frame(3, 9), block_frame(3, 9)],
@@ -936,6 +1004,7 @@ mod tests {
         let base = capture_baseline(&done_pred(), &eval, (0, 0, 90, 80), &capture).unwrap();
         assert!(base.predicate_before.is_true());
         assert_eq!(base.region_hash, 0);
+        assert_eq!(base.region_luma, 0.0);
 
         let mut probe = ScriptedProbe::new(SettlePath::XDamage, vec![0.0]);
         let mut telemetry = RunTelemetry::new();

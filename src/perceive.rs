@@ -116,10 +116,10 @@
 //! The resolver runs on the calling thread. Gesture dispatch stays on
 //! the rtrb ring owned by the input thread (B3).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -428,14 +428,22 @@ pub struct GenerationSnapshot {
     pub by_text: HashMap<(u64, u64), usize>,
     /// Tier-0 spatial index over the visible, non-zero-area nodes.
     pub spatial: SpatialIndex,
-    /// `input[type=password]` boxes, main-viewport CSS px (x, y, w, h),
-    /// for screenshot redaction before bytes leave the VM.
+    /// `input[type=password]` boxes, DEVICE px (x, y, w, h), for screenshot
+    /// redaction before bytes leave the VM. Converted from the node's
+    /// main-viewport CSS px box via its dpr and clipped to the viewport;
+    /// boxes partially off-viewport are clipped, not dropped.
     pub password_boxes: Vec<(u32, u32, u32, u32)>,
     /// AX merge status: true when the AX side was refreshed for this
     /// generation after the last structural change.
     pub ax_merged: bool,
     /// Main viewport size, CSS px, that the spatial index was built for.
     pub viewport: (f64, f64),
+    /// v1.2, fix 11: normalized accessible name -> node indices, built
+    /// once per snapshot. `tier0_lookup` does an O(1) lookup instead of
+    /// a linear scan with string compares per query. Indexes ALL nodes
+    /// (not just clickable ones) so ambiguity counting matches the old
+    /// linear scan exactly.
+    pub name_index: HashMap<Box<str>, Vec<usize>>,
 }
 
 /// The versioned tree: owns the mutable state, publishes immutable
@@ -731,17 +739,10 @@ fn apply_event(
                 return Err(RejectReason::UnknownFrame);
             }
             state.frames.remove(frame_id);
-            // Every node owned by the detached frame leaves the tree.
-            let owned: Vec<usize> = state
-                .nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| n.frame_id.as_ref() == frame_id.as_ref())
-                .map(|(i, _)| i)
-                .collect();
-            for i in owned.into_iter().rev() {
-                remove_node_at(state, i);
-            }
+            // Every node owned by the detached frame leaves the tree in
+            // one batch: single reindex, no orphans. v1.2, fix 8: the old
+            // code called remove_node_at per node (O(n) reindex each).
+            remove_nodes_where(state, |n| n.frame_id.as_ref() == frame_id.as_ref());
             Ok(())
         }
         TreeEvent::AxRefreshed { nodes } => {
@@ -815,32 +816,63 @@ fn link_child(state: &mut TreeState, parent: i64, child: i64) {
     state.parent_of.insert(child, parent);
 }
 
-/// Remove the node at `idx`, keeping every map consistent. Swap-remove is
-/// O(1); the moved node's NodeRef entry is fixed from the node now sitting
-/// at `idx`; structural edges are unlinked; the backend index is rebuilt
-/// (O(n), rare path).
-fn remove_node_at(state: &mut TreeState, idx: usize) {
-    debug_assert!(idx < state.nodes.len());
-    let last = state.nodes.len() - 1;
-    let dead_ref = state.nodes[idx].node_ref.map(|r| r.0);
-    if let Some(r) = dead_ref {
+/// Remove every node matching `doomed`, unlinking structural edges and
+/// rebuilding the indices ONCE. v1.2, fix 8: the old per-node removal
+/// reindexed (O(n)) on every removal, and dropping a node without its
+/// subtree left descendants as clickable orphans.
+fn remove_nodes_where(state: &mut TreeState, mut doomed: impl FnMut(&TreeNode) -> bool) {
+    let dead: HashSet<i64> = state
+        .nodes
+        .iter()
+        .filter(|n| doomed(n))
+        .filter_map(|n| n.node_ref.map(|r| r.0))
+        .collect();
+    state.nodes.retain(|n| !doomed(n));
+    // Unlink structural edges touching dead refs.
+    for &r in &dead {
         state.by_node_ref.remove(&r);
-        // Unlink the structural edges.
-        if let Some(p) = state.parent_of.remove(&r) {
-            if let Some(kids) = state.children.get_mut(&p) {
-                kids.retain(|&k| k != r);
-            }
-        }
+        state.parent_of.remove(&r);
         state.children.remove(&r);
     }
-    state.nodes.swap_remove(idx);
-    if idx != last {
-        // The node that was at `last` now sits at `idx`: fix its entry.
-        if let Some(r) = state.nodes[idx].node_ref {
-            state.by_node_ref.insert(r.0, idx);
+    // Surviving nodes must not point at dead parents or children.
+    state.parent_of.retain(|_, p| !dead.contains(p));
+    for kids in state.children.values_mut() {
+        kids.retain(|k| !dead.contains(k));
+    }
+    // Rebuild the index maps once.
+    state.by_node_ref.clear();
+    for (i, n) in state.nodes.iter().enumerate() {
+        if let Some(r) = n.node_ref {
+            state.by_node_ref.insert(r.0, i);
         }
     }
     state.reindex_backend();
+}
+
+/// Remove the node at `idx` AND its whole subtree, keeping every map
+/// consistent. Descendants must not survive as clickable orphans.
+fn remove_node_at(state: &mut TreeState, idx: usize) {
+    debug_assert!(idx < state.nodes.len());
+    match state.nodes[idx].node_ref.map(|r| r.0) {
+        Some(root) => {
+            // Collect the subtree via the structural children map.
+            let mut doomed = HashSet::new();
+            let mut stack = vec![root];
+            while let Some(x) = stack.pop() {
+                if doomed.insert(x) {
+                    if let Some(kids) = state.children.get(&x) {
+                        stack.extend(kids.iter().copied());
+                    }
+                }
+            }
+            remove_nodes_where(state, |n| n.node_ref.is_some_and(|r| doomed.contains(&r.0)));
+        }
+        None => {
+            // Ref-less node: nothing tracks its children; drop the node.
+            state.nodes.swap_remove(idx);
+            state.reindex_backend();
+        }
+    }
 }
 
 /// Apply an attribute mutation that affects the tree. Returns nothing;
@@ -865,7 +897,10 @@ fn apply_attr(n: &mut TreeNode, name: &str, value: &str, present: bool) {
             // accessible-name computation needs the document; the event
             // layer records the attribute value as the name candidate and
             // the next AX merge fixes it authoritatively.
-            if present {
+            // v1.2, fix 2a: NEVER copy a password field's value into the
+            // accessible name. The value of type=password is a secret;
+            // it must not leak into name (which feeds BM25/features).
+            if present && !(name == "value" && n.is_password) {
                 n.name = normalize_desc(value).into();
                 n.text_hash = fx64(format!("{}|{}|{}", n.role, n.name, n.text).as_bytes());
             }
@@ -891,6 +926,7 @@ impl GenerationSnapshot {
             by_text: HashMap::new(),
             spatial: SpatialIndex::empty(viewport),
             password_boxes: Vec::new(),
+            name_index: HashMap::new(),
             ax_merged: false,
             viewport,
         }
@@ -907,15 +943,44 @@ impl GenerationSnapshot {
     ) -> Self {
         let mut by_backend = HashMap::with_capacity(nodes.len());
         let mut by_text = HashMap::with_capacity(nodes.len());
+        let mut name_index: HashMap<Box<str>, Vec<usize>> = HashMap::with_capacity(nodes.len());
         let mut password_boxes = Vec::new();
         for (i, n) in nodes.iter().enumerate() {
             by_backend.insert(n.backend_node_id, i);
             by_text.insert((n.backend_node_id, n.text_hash), i);
+            // v1.2, fix 11: index every node by name (ambiguity counting
+            // must see non-clickable nodes too, exactly like the old
+            // linear scan).
+            name_index.entry(n.name.clone()).or_default().push(i);
             if n.is_password {
-                let (x, y) = n.at;
-                let (w, h) = n.wh;
-                if x >= 0.0 && y >= 0.0 && w > 0.0 && h > 0.0 {
-                    password_boxes.push((x as u32, y as u32, w as u32, h as u32));
+                // v1.2, fix 6: device px (the redaction target is a
+                // device-px buffer), rounded not truncated; clip against
+                // the viewport instead of dropping boxes that start
+                // off-viewport. The old code truncated CSS px and dropped
+                // any box with x < 0 or y < 0, so a field slightly outside
+                // the viewport was never zeroed.
+                let dpr = if n.dpr.is_finite() && n.dpr > 0.0 {
+                    n.dpr
+                } else {
+                    1.0
+                };
+                let x0 = (n.at.0 * dpr).round();
+                let y0 = (n.at.1 * dpr).round();
+                let x1 = ((n.at.0 + n.wh.0) * dpr).round();
+                let y1 = ((n.at.1 + n.wh.1) * dpr).round();
+                let vw = (viewport.0 * dpr).round();
+                let vh = (viewport.1 * dpr).round();
+                let cx0 = x0.max(0.0).min(vw);
+                let cy0 = y0.max(0.0).min(vh);
+                let cx1 = x1.max(0.0).min(vw);
+                let cy1 = y1.max(0.0).min(vh);
+                if cx1 > cx0 && cy1 > cy0 {
+                    password_boxes.push((
+                        cx0 as u32,
+                        cy0 as u32,
+                        (cx1 - cx0) as u32,
+                        (cy1 - cy0) as u32,
+                    ));
                 }
             }
         }
@@ -927,6 +992,7 @@ impl GenerationSnapshot {
             by_text,
             spatial,
             password_boxes,
+            name_index,
             ax_merged,
             viewport,
         }
@@ -1072,16 +1138,58 @@ pub const SPATIAL_CELL_PX: f64 = 64.0;
 /// Incrementally built spatial index over one generation's nodes.
 /// Zero-area and hidden nodes are culled in the single build pass, so
 /// they can never short-circuit a click.
-#[derive(Debug, Clone)]
 pub struct SpatialIndex {
     cell: f64,
     cols: usize,
     rows: usize,
     viewport: (f64, f64),
-    /// Per-cell node indices into the snapshot's node vec.
-    cells: Vec<Vec<usize>>,
+    /// Per-cell node indices into the snapshot's node vec, in CSR form:
+    /// `entries[offsets[k]..offsets[k+1]]` holds the (sorted) node
+    /// indices for cell k. v1.2, fix 11: replaces `Vec<Vec<usize>>` (one
+    /// heap allocation per cell plus a pointer dereference per visit)
+    /// with two flat vecs.
+    entries: Vec<usize>,
+    offsets: Vec<usize>,
     /// Number of indexed nodes (post-cull).
     indexed: usize,
+    /// v1.2, fix 10: epoch-stamp dedup. `seen[i] == epoch` means node i
+    /// was already emitted by the current query. Replaces the
+    /// `vec![false; nodes.len()]` allocation on every query. Atomics keep
+    /// the `&self` query API and `Sync` for the `Arc`-shared snapshot.
+    seen: Vec<AtomicU32>,
+    epoch: AtomicU32,
+}
+
+impl Clone for SpatialIndex {
+    fn clone(&self) -> Self {
+        Self {
+            cell: self.cell,
+            cols: self.cols,
+            rows: self.rows,
+            viewport: self.viewport,
+            entries: self.entries.clone(),
+            offsets: self.offsets.clone(),
+            indexed: self.indexed,
+            seen: self
+                .seen
+                .iter()
+                .map(|s| AtomicU32::new(s.load(Ordering::Relaxed)))
+                .collect(),
+            epoch: AtomicU32::new(self.epoch.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl std::fmt::Debug for SpatialIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpatialIndex")
+            .field("cell", &self.cell)
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("viewport", &self.viewport)
+            .field("indexed", &self.indexed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SpatialIndex {
@@ -1094,8 +1202,11 @@ impl SpatialIndex {
             cols,
             rows,
             viewport,
-            cells: vec![Vec::new(); cols * rows],
+            entries: Vec::new(),
+            offsets: vec![0; cols * rows + 1],
             indexed: 0,
+            seen: Vec::new(),
+            epoch: AtomicU32::new(0),
         }
     }
 
@@ -1104,12 +1215,35 @@ impl SpatialIndex {
     /// field on a structural box alone; those go through the cascade).
     pub fn build(nodes: &[TreeNode], viewport: (f64, f64)) -> Self {
         let mut idx = Self::empty(viewport);
+        // Stage into temp cell vecs (insertion order = node order, so
+        // each cell's list is already sorted), then flatten to CSR.
+        let mut tmp = vec![Vec::new(); idx.cols * idx.rows];
+        let mut indexed = 0usize;
         for (i, n) in nodes.iter().enumerate() {
             if !n.has_area() || !n.visible || !n.enabled || n.is_password {
                 continue;
             }
-            idx.insert(i, n.at.0, n.at.1, n.wh.0, n.wh.1);
+            let (c0, r0, c1, r1) = idx.cell_range(n.at.0, n.at.1, n.wh.0, n.wh.1);
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    tmp[r * idx.cols + c].push(i);
+                }
+            }
+            indexed += 1;
         }
+        let mut offsets = Vec::with_capacity(tmp.len() + 1);
+        let mut entries = Vec::new();
+        offsets.push(0);
+        for cell in &tmp {
+            entries.extend(cell.iter().copied());
+            offsets.push(entries.len());
+        }
+        idx.entries = entries;
+        idx.offsets = offsets;
+        idx.indexed = indexed;
+        // v1.2, fix 10: size the epoch stamps once here; queries never
+        // allocate.
+        idx.seen = (0..nodes.len()).map(|_| AtomicU32::new(0)).collect();
         idx
     }
 
@@ -1126,29 +1260,43 @@ impl SpatialIndex {
         )
     }
 
-    fn insert(&mut self, node_idx: usize, x: f64, y: f64, w: f64, h: f64) {
-        let (c0, r0, c1, r1) = self.cell_range(x, y, w, h);
-        for r in r0..=r1 {
-            for c in c0..=c1 {
-                self.cells[r * self.cols + c].push(node_idx);
-            }
-        }
-        self.indexed += 1;
-    }
-
     /// Nodes whose boxes touch the query rect (cell pre-filter, exact
     /// box test). The query node itself is included when it overlaps.
     pub fn overlapping(&self, nodes: &[TreeNode], x: f64, y: f64, w: f64, h: f64) -> Vec<usize> {
         let (c0, r0, c1, r1) = self.cell_range(x, y, w, h);
         let mut out = Vec::new();
-        let mut seen = vec![false; nodes.len()];
+        // v1.2, fix 10: epoch stamp instead of `vec![false; nodes.len()]`
+        // per query. 0 means "never seen"; epochs start at 1.
+        let epoch = {
+            let prev = self.epoch.fetch_add(1, Ordering::Relaxed);
+            if prev == u32::MAX {
+                // Wraparound after 4B queries: reset stamps, restart at 1.
+                for s in &self.seen {
+                    s.store(0, Ordering::Relaxed);
+                }
+                self.epoch.store(2, Ordering::Relaxed);
+                1
+            } else {
+                prev + 1
+            }
+        };
         for r in r0..=r1 {
             for c in c0..=c1 {
-                for &i in &self.cells[r * self.cols + c] {
-                    if seen[i] {
+                // v1.2, fix 11: CSR cell lookup (flat slices, no pointer
+                // chase per cell).
+                let k = r * self.cols + c;
+                let (lo, hi) = (self.offsets[k], self.offsets[k + 1]);
+                for &i in &self.entries[lo..hi] {
+                    // Stamp-and-test in one atomic swap: first visit this
+                    // epoch sees the old stamp (!= epoch) and proceeds.
+                    let fresh = self
+                        .seen
+                        .get(i)
+                        .map(|s| s.swap(epoch, Ordering::Relaxed) != epoch)
+                        .unwrap_or(true);
+                    if !fresh {
                         continue;
                     }
-                    seen[i] = true;
                     let n = &nodes[i];
                     if boxes_overlap((x, y, w, h), (n.at.0, n.at.1, n.wh.0, n.wh.1)) {
                         out.push(i);
@@ -1181,7 +1329,21 @@ pub fn is_occluded(snap: &GenerationSnapshot, node_idx: usize) -> bool {
     let others = snap
         .spatial
         .overlapping(&snap.nodes, n.at.0, n.at.1, n.wh.0, n.wh.1);
-    others.iter().any(|&i| i != node_idx)
+    // v1.2, fix 12: ignore boxes that CONTAIN the target on all four
+    // sides (ancestors). The old code treated any overlap as occlusion,
+    // so a button inside a dialog was "occluded" by the dialog.
+    others.iter().any(|&i| {
+        if i == node_idx {
+            return false;
+        }
+        let o = &snap.nodes[i];
+        // Contains on all four sides? Then it's an ancestor, not an occluder.
+        let contains = o.at.0 <= n.at.0
+            && o.at.1 <= n.at.1
+            && o.at.0 + o.wh.0 >= n.at.0 + n.wh.0
+            && o.at.1 + o.wh.1 >= n.at.1 + n.wh.1;
+        !contains
+    })
 }
 
 /// Why Tier-0 fell through to the cascade.
@@ -1219,29 +1381,23 @@ pub enum Tier0Verdict {
 /// resolver cascade. This runs BEFORE BM25: on a warm page it is the
 /// reason steady-state resolve stays under 1ms.
 pub fn tier0_lookup(snap: &GenerationSnapshot, desc_norm: &str) -> Tier0Verdict {
-    let mut found: Option<usize> = None;
-    let mut count = 0usize;
-    for (i, n) in snap.nodes.iter().enumerate() {
-        if n.name.as_ref() == desc_norm {
-            count += 1;
-            if found.is_none() {
-                found = Some(i);
-            }
-            if count > 1 {
-                return Tier0Verdict::FallThrough {
-                    reason: Tier0Miss::Ambiguous,
-                };
-            }
-        }
-    }
-    let i = match found {
-        Some(i) => i,
+    // v1.2, fix 11: O(1) name-index lookup. Same semantics as the old
+    // linear scan: ambiguity counts every node with the name (clickable
+    // or not); only the unique match is then checked for clickability.
+    let matches = match snap.name_index.get(desc_norm) {
         None => {
             return Tier0Verdict::FallThrough {
                 reason: Tier0Miss::NoMatch,
             }
         }
+        Some(v) => v,
     };
+    if matches.len() > 1 {
+        return Tier0Verdict::FallThrough {
+            reason: Tier0Miss::Ambiguous,
+        };
+    }
+    let i = matches[0];
     let n = &snap.nodes[i];
     if !n.enabled || !n.visible || n.is_password || !n.has_area() {
         return Tier0Verdict::FallThrough {
@@ -1575,6 +1731,36 @@ enum RunError {
     Failed(String),
 }
 
+/// Join handles for the stdout/stderr drainer threads.
+type PipeDrainers = (
+    Option<thread::JoinHandle<Vec<u8>>>,
+    Option<thread::JoinHandle<Vec<u8>>>,
+);
+
+/// v1.2, fix 9: start draining a child's stdout/stderr on dedicated
+/// threads and return the join handles. Call BEFORE waiting on the
+/// child: a child that fills the 64KB pipe buffer blocks on write, so
+/// reading only after exit deadlocks.
+fn spawn_pipe_drainers(child: &mut std::process::Child) -> PipeDrainers {
+    let stdout_reader = child.stdout.take().map(|mut out| {
+        thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut err| {
+        thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = err.read_to_end(&mut buf);
+            buf
+        })
+    });
+    (stdout_reader, stderr_reader)
+}
+
 /// Spawn `tesseract stdin stdout --psm 6 -l eng`, pipe the PNG in, kill
 /// the child at the absolute deadline. `--psm 6` (uniform text block)
 /// suits UI regions; `-l eng` is the language installed on the VM
@@ -1603,21 +1789,23 @@ fn run_tesseract(bin: &PathBuf, png: &[u8], deadline: Instant) -> Result<String,
         // stdin dropped here: EOF to the child.
     }
 
+    // Drain stdout/stderr on dedicated threads STARTING NOW, not after
+    // the child exits (see spawn_pipe_drainers).
+    let (stdout_reader, stderr_reader) = spawn_pipe_drainers(&mut child);
+
     // Deadline enforcement: poll, kill at expiry. There is no
     // wait_timeout on stable std, so this is the honest implementation.
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = out.read_to_end(&mut stdout);
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = err.read_to_end(&mut stderr);
-                }
+                // Pipes are at EOF now (or will be once the reader
+                // threads drain); joining gives us the full output.
+                let stdout = stdout_reader
+                    .map(|h| h.join().unwrap_or_default())
+                    .unwrap_or_default();
+                let stderr = stderr_reader
+                    .map(|h| h.join().unwrap_or_default())
+                    .unwrap_or_default();
                 if status.success() {
                     let text = String::from_utf8_lossy(&stdout).trim().to_string();
                     return Ok(text);
@@ -1842,18 +2030,33 @@ pub fn refine_small_target(
     let zoom = (pass.target_side_dev_px / (min_side * dpr)).clamp(1.0, pass.max_zoom);
 
     // Region: hit box expanded by pad, clamped to the viewport.
+    // v1.2, fix 7: convert through to_screen (zoom x dpr + window origin,
+    // round-half-away) instead of truncating `(rx * dpr) as u32`, which
+    // dropped the fractional pixel and ignored zoom/origin.
     let rx = (node.at.0 - pass.pad_css).max(0.0);
     let ry = (node.at.1 - pass.pad_css).max(0.0);
     let rx1 = (node.at.0 + node.wh.0 + pass.pad_css).min(viewport.0);
     let ry1 = (node.at.1 + node.wh.1 + pass.pad_css).min(viewport.1);
     let rw = (rx1 - rx).max(1.0);
     let rh = (ry1 - ry).max(1.0);
-    let region_dev = (
-        (rx * dpr) as u32,
-        (ry * dpr) as u32,
-        (rw * dpr).max(1.0) as u32,
-        (rh * dpr).max(1.0) as u32,
-    );
+    let region_dev = {
+        use super::coords::{to_screen, MainViewportCss, RootDevicePx};
+        let tl = to_screen(MainViewportCss(rx, ry), 1.0, dpr, RootDevicePx(0.0, 0.0))
+            .map_err(|e| RefineError::RegionCapture(format!("to_screen: {e}")))?;
+        let br = to_screen(
+            MainViewportCss(rx + rw, ry + rh),
+            1.0,
+            dpr,
+            RootDevicePx(0.0, 0.0),
+        )
+        .map_err(|e| RefineError::RegionCapture(format!("to_screen: {e}")))?;
+        (
+            tl.0.max(0.0) as u32,
+            tl.1.max(0.0) as u32,
+            (br.0 - tl.0).max(1.0) as u32,
+            (br.1 - tl.1).max(1.0) as u32,
+        )
+    };
     let cap = capture(region_dev).map_err(RefineError::RegionCapture)?;
     validate_capture(&cap).map_err(|e| RefineError::RegionCapture(format!("{e:#}")))?;
 
@@ -2014,6 +2217,31 @@ mod tests {
     use std::path::PathBuf;
 
     const VIEWPORT: (f64, f64) = (1280.0, 800.0);
+
+    #[test]
+    fn spatial_overlapping_dedups_across_cells_and_queries() {
+        // v1.2, fix 10: the epoch stamp must dedup a node visited via
+        // multiple cells within one query, AND must not leak dedup state
+        // into the next query (each query gets a fresh epoch).
+        let nodes = vec![
+            // Big node spanning several cells.
+            tnode(101, "big", 0.0, 0.0, 500.0, 500.0),
+            tnode(102, "small", 10.0, 10.0, 20.0, 20.0),
+        ];
+        let idx = SpatialIndex::build(&nodes, VIEWPORT);
+        // Query covering both: each node exactly once despite multi-cell
+        // membership.
+        let mut r1 = idx.overlapping(&nodes, 0.0, 0.0, 600.0, 600.0);
+        r1.sort_unstable();
+        assert_eq!(r1, vec![0, 1]);
+        // Second identical query: dedup state must not leak; same result.
+        let mut r2 = idx.overlapping(&nodes, 0.0, 0.0, 600.0, 600.0);
+        r2.sort_unstable();
+        assert_eq!(r2, vec![0, 1]);
+        // Narrow query: only the big node.
+        let r3 = idx.overlapping(&nodes, 400.0, 400.0, 50.0, 50.0);
+        assert_eq!(r3, vec![0]);
+    }
 
     fn tnode(backend: u64, name: &str, x: f64, y: f64, w: f64, h: f64) -> TreeNode {
         TreeNode::new(
@@ -2287,6 +2515,82 @@ mod tests {
     }
 
     #[test]
+    fn child_removed_drops_the_whole_subtree() {
+        // v1.2, fix 8: removing a node must remove its descendants too.
+        // The old code unlinked the node and dropped its edge list, but
+        // descendants stayed in `nodes` as clickable orphans.
+        let mut tree = VersionedTree::new(VIEWPORT);
+        tree.rebuild_from_snapshot(Vec::new(), vec!["main".to_string()]);
+        let gen = tree.generation();
+        let batch = EventBatch {
+            seq: 1,
+            generation: gen,
+            events: vec![
+                TreeEvent::SetChildNodes {
+                    parent: NodeRef(0),
+                    nodes: vec![wire(10, 100)],
+                },
+                TreeEvent::SetChildNodes {
+                    parent: NodeRef(10),
+                    nodes: vec![wire(1, 101)],
+                },
+                TreeEvent::SetChildNodes {
+                    parent: NodeRef(1),
+                    nodes: vec![wire(2, 102)],
+                },
+                TreeEvent::SetChildNodes {
+                    parent: NodeRef(2),
+                    nodes: vec![wire(3, 103)],
+                },
+            ],
+        };
+        assert_eq!(
+            tree.apply_batch(&batch),
+            BatchOutcome::Applied { events: 4 }
+        );
+        assert_eq!(tree.node_count(), 4);
+        // Remove the parent: the whole subtree (refs 1, 2, 3) must go;
+        // ref 10 survives.
+        let gen = tree.generation();
+        let batch = EventBatch {
+            seq: 2,
+            generation: gen,
+            events: vec![TreeEvent::ChildRemoved {
+                parent: NodeRef(10),
+                node: NodeRef(1),
+            }],
+        };
+        assert_eq!(
+            tree.apply_batch(&batch),
+            BatchOutcome::Applied { events: 1 }
+        );
+        let snap = tree.snapshot();
+        assert_eq!(tree.node_count(), 1, "only ref 10 survives");
+        for b in [101u64, 102, 103] {
+            assert!(
+                !snap.by_backend.contains_key(&b),
+                "backend {b} must not survive as an orphan"
+            );
+        }
+        assert!(snap.by_backend.contains_key(&100));
+        // The surviving tree still resolves: insert a fresh node.
+        let gen = tree.generation();
+        let batch = EventBatch {
+            seq: 3,
+            generation: gen,
+            events: vec![TreeEvent::SetChildNodes {
+                parent: NodeRef(0),
+                nodes: vec![wire(4, 104)],
+            }],
+        };
+        assert_eq!(
+            tree.apply_batch(&batch),
+            BatchOutcome::Applied { events: 1 }
+        );
+        assert!(tree.snapshot().by_backend.contains_key(&104));
+    }
+
+    #[test]
     fn set_child_nodes_is_authoritative() {
         let mut tree = tree_with_three();
         let gen = tree.generation();
@@ -2493,6 +2797,83 @@ mod tests {
     }
 
     #[test]
+    fn password_boxes_are_device_px_and_clipped_not_dropped() {
+        // v1.2, fix 6: boxes must be device px (dpr-scaled, rounded) and
+        // clipped to the viewport. The old code truncated CSS px and
+        // dropped any box with x < 0 or y < 0, so a field slightly
+        // off-viewport was never zeroed.
+        let nodes = vec![
+            // dpr 2: (10,20,100,24) CSS -> (20,40,200,48) device.
+            TreeNode::new(
+                201,
+                1,
+                "textbox",
+                "pw1",
+                "",
+                "main",
+                (10.0, 20.0),
+                (100.0, 24.0),
+                2.0,
+                true,
+                true,
+                true,
+            ),
+            // Starts off-viewport: x=-5 CSS at dpr 1 -> clipped to x=0,
+            // not dropped.
+            TreeNode::new(
+                202,
+                1,
+                "textbox",
+                "pw2",
+                "",
+                "main",
+                (-5.0, 30.0),
+                (50.0, 20.0),
+                1.0,
+                true,
+                true,
+                true,
+            ),
+            // Fully off-viewport: dropped (nothing to clip to).
+            TreeNode::new(
+                203,
+                1,
+                "textbox",
+                "pw3",
+                "",
+                "main",
+                (-100.0, 30.0),
+                (50.0, 20.0),
+                1.0,
+                true,
+                true,
+                true,
+            ),
+            // Non-password node: never in the list.
+            TreeNode::new(
+                204,
+                1,
+                "textbox",
+                "plain",
+                "",
+                "main",
+                (10.0, 60.0),
+                (100.0, 24.0),
+                1.0,
+                true,
+                true,
+                false,
+            ),
+        ];
+        let snap = GenerationSnapshot::build(3, &nodes, true, VIEWPORT);
+        assert_eq!(
+            snap.password_boxes,
+            vec![(20, 40, 200, 48), (0, 30, 45, 20)],
+            "device-px conversion + clipping; fully-offscreen dropped, plain excluded"
+        );
+    }
+
+    #[test]
     fn check_hit_unoccluded_validates_resolver_winner() {
         let snap = tier0_snap();
         assert!(check_hit_unoccluded(&snap, 101));
@@ -2634,6 +3015,37 @@ mod tests {
             elapsed < Duration::from_millis(2500),
             "deadline enforced, took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn pipe_drainers_prevent_deadlock_on_large_output() {
+        // v1.2, fix 9: a child writing more than the 64KB pipe buffer
+        // must not deadlock the parent. Feeds 1MB through `cat` with the
+        // drainers running (the old read-after-exit pattern would block
+        // forever here: cat blocks on a full stdout pipe, the parent
+        // blocks waiting for exit).
+        use std::io::Write;
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sh must exist for this test");
+        // Drainers start BEFORE stdin is written: cat only keeps reading
+        // stdin while its stdout is being drained.
+        let (out_h, err_h) = spawn_pipe_drainers(&mut child);
+        let big = vec![b'x'; 1 << 20];
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&big).expect("stdin write");
+        }
+        let status = child.wait().expect("child wait");
+        let out = out_h.map(|h| h.join().unwrap()).unwrap_or_default();
+        let _ = err_h.map(|h| h.join().unwrap());
+        assert!(status.success());
+        assert_eq!(out.len(), 1 << 20, "full 1MB drained without deadlock");
+        assert!(out.iter().all(|&b| b == b'x'));
     }
 
     #[test]
@@ -2806,6 +3218,42 @@ mod tests {
         assert_eq!(out.backend_node_id, 201);
         assert_eq!(out.at, (103.0, 103.0), "locked to the node center");
         assert_eq!(out.zoom_used, 8.0);
+    }
+
+    #[test]
+    fn refine_region_uses_to_screen_rounding_not_truncation() {
+        // v1.2, fix 7: the capture region must go through to_screen
+        // (round-half-away), not `(rx * dpr) as u32` truncation.
+        // Node at x=102.6 CSS, pad 8 -> rx = 94.6; truncation would give
+        // 94, to_screen gives 95.
+        use std::cell::Cell;
+        let node = TreeNode::new(
+            201,
+            1,
+            "button",
+            "x",
+            "",
+            "main",
+            (102.6, 100.0),
+            (6.0, 6.0),
+            1.0,
+            true,
+            true,
+            false,
+        );
+        let snap = GenerationSnapshot::build(1, &[node], true, VIEWPORT);
+        let pass = CropZoomPass::default();
+        let seen = Cell::new((0u32, 0u32, 0u32, 0u32));
+        let capture = |r: (u32, u32, u32, u32)| -> Result<Capture, String> {
+            seen.set(r);
+            Ok(checker_capture((102.6, 100.0), (6.0, 6.0), ZOOM_PAD_CSS))
+        };
+        let hit = small_hit(201, 6.0, 6.0);
+        let _ = refine_small_target(&pass, &hit, &snap, "x", &capture, VIEWPORT, 1.0);
+        let r = seen.get();
+        // rx = 94.6 -> 95 (round), ry = 92.0 -> 92; w = 22.0 -> 22.
+        assert_eq!((r.0, r.1), (95, 92), "region origin rounded, not truncated");
+        assert_eq!((r.2, r.3), (22, 22));
     }
 
     #[test]

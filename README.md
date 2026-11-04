@@ -59,4 +59,6 @@ The `legacy` module is adapted from that repo's `x11_mouse.rs`.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+PolyForm Noncommercial 1.0.0: free for noncommercial use. Any commercial use
+requires a separate commercial license from Movahedi Solutions.
+See [LICENSE](LICENSE).

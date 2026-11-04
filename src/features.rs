@@ -1,4 +1,4 @@
-//! Frozen feature schema v1 for the resolution cascade (mouse-future Phase 0).
+//! Frozen feature schema v2 for the resolution cascade (mouse-future Phase 0).
 //!
 //! The 137-dim vector is laid out as:
 //!
@@ -17,6 +17,12 @@
 //! [136]  dot(desc_emb, cand_emb)
 //! ```
 //!
+//! v2 change (fix 5): "candidate" is the normalized accessible NAME +
+//! visible TEXT (previously name only). Stage 1 (BM25) and the cached
+//! embedding already scored name+text; stage 2 now scores the same
+//! object. Jaccard, edit similarity, dims 72..136, and the dot product
+//! all see the visible text.
+//!
 //! Signed hashing contract (pinned by the golden pairs below):
 //! text is lowercased with collapsed whitespace; unigrams, bigrams, and
 //! trigrams are taken over its chars (short strings keep their unigrams and
@@ -34,10 +40,10 @@
 //! floats; the O(n*m) edit distance is capped (long strings read as
 //! missing, feature value 0).
 
-use std::collections::HashSet;
-
 /// Frozen feature schema version. Bump on ANY layout change.
-pub const FEATURE_SCHEMA_VERSION: u32 = 1;
+/// v2: candidate text (name + visible text) feeds Jaccard, edit
+/// similarity, dims 72..136, and the dot product (fix 5).
+pub const FEATURE_SCHEMA_VERSION: u32 = 2;
 /// Total feature dimension.
 pub const FEATURE_DIM: usize = 137;
 /// Signed trigram embedding dimension.
@@ -116,12 +122,28 @@ fn finite_f32(v: f64, fallback: f32) -> f32 {
 }
 
 /// Lowercase + collapse whitespace, the shared normalization for tokens,
-/// names, and n-gram text.
+/// names, and n-gram text. v1.2, fix 31b: single-pass builder, no
+/// intermediate Vec (the old to_lowercase().split_whitespace().collect()
+/// .join() allocated twice per call).
 fn normalize_text(s: &str) -> String {
-    s.to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = true; // leading whitespace collapses to nothing
+    for c in s.chars().flat_map(|c| c.to_lowercase()) {
+        if c.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(c);
+            in_ws = false;
+        }
+    }
+    // Trim the single trailing space the loop may have left.
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
 }
 
 /// The FxHash-like u64 contract pinned by the golden pairs:
@@ -158,36 +180,52 @@ fn l2_normalize_f64(acc: &[i32; EMBED_DIM]) -> [f32; EMBED_DIM] {
 /// Unigrams, bigrams, and trigrams over the normalized chars; signed counts
 /// hashed per the module contract; L2-normalized. Empty text yields the
 /// zero vector; short text like "OK" yields a non-zero vector.
+///
+/// v1.2, fix 31a: the n-gram window is hashed in place (per-char UTF-8
+/// bytes fed directly to the FxHash-like mixer). The old code built a
+/// `String` per n-gram (`chars[i..i+n].iter().collect()`), which was
+/// ~3L heap allocations per embedding.
 pub fn ngram_embedding(text: &str) -> [f32; EMBED_DIM] {
-    let norm = normalize_text(text);
-    let chars: Vec<char> = norm.chars().collect();
-    let mut acc = [0i32; EMBED_DIM];
-    for n in 1..=3usize {
-        if chars.len() < n {
-            continue;
-        }
-        for i in 0..=(chars.len() - n) {
-            let unit: String = chars[i..i + n].iter().collect();
-            let h = fx_hash(unit.as_bytes());
-            let idx = ((h >> 1) % EMBED_DIM as u64) as usize;
-            let sign = if h & 1 == 0 { 1i32 } else { -1i32 };
-            acc[idx] += sign;
-        }
-    }
-    l2_normalize_f64(&acc)
+    ngram_embedding_normalized(&normalize_text(text))
 }
 
 fn jaccard_token_overlap(a: &str, b: &str) -> f64 {
+    // v1.2, fix 31c: no HashSets. Sort the two token slices and
+    // merge-count the intersection/union. Token sets are small; the
+    // sort is cheaper than two hash tables and keeps the hot path
+    // allocation-free (the Vecs are reused per call, not per candidate
+    // in the resolve loop when the caller pre-sorts).
     let na = normalize_text(a);
     let nb = normalize_text(b);
-    let sa: HashSet<&str> = na.split(' ').filter(|t| !t.is_empty()).collect();
-    let sb: HashSet<&str> = nb.split(' ').filter(|t| !t.is_empty()).collect();
-    if sa.is_empty() && sb.is_empty() {
+    let mut ta: Vec<&str> = na.split(' ').filter(|t| !t.is_empty()).collect();
+    let mut tb: Vec<&str> = nb.split(' ').filter(|t| !t.is_empty()).collect();
+    if ta.is_empty() && tb.is_empty() {
         return 0.0;
     }
-    let inter = sa.intersection(&sb).count() as f64;
-    let union = sa.union(&sb).count() as f64;
-    inter / union
+    ta.sort_unstable();
+    tb.sort_unstable();
+    ta.dedup();
+    tb.dedup();
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut inter, mut union) = (0usize, 0usize);
+    while i < ta.len() && j < tb.len() {
+        union += 1;
+        match ta[i].cmp(tb[j]) {
+            std::cmp::Ordering::Equal => {
+                inter += 1;
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    union += (ta.len() - i) + (tb.len() - j);
+    if union == 0 {
+        0.0
+    } else {
+        inter as f64 / union as f64
+    }
 }
 
 fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
@@ -261,24 +299,101 @@ fn dot(a: &[f32; EMBED_DIM], b: &[f32; EMBED_DIM]) -> f32 {
 /// Assemble the frozen 137-dim feature vector for one
 /// (description, candidate) pair. Every float is finite-guarded.
 pub fn assemble(inp: &FeatureInputs) -> [f32; FEATURE_DIM] {
-    let mut out = [0.0f32; FEATURE_DIM];
-    out[0] = finite_f32(inp.bm25, -10.0).max(-10.0);
-    out[1] = finite_f32(
-        jaccard_token_overlap(inp.description, inp.candidate_text),
-        0.0,
-    )
-    .clamp(0.0, 1.0);
-    out[2] = finite_f32(edit_similarity(inp.description, inp.candidate_text), 0.0).clamp(0.0, 1.0);
-    out[3] = f32::from(inp.role_intent_match);
-    out[4] = f32::from(inp.exact_name);
-    out[5] = finite_f32(log_area_norm(inp.candidate_w, inp.candidate_h), 0.0).clamp(0.0, 1.0);
-    out[6] = finite_f32(position_prior(inp.candidate_center, inp.viewport), 0.0).clamp(0.0, 1.0);
-    out[7] = f32::from(inp.enabled_visible);
-    let desc_emb = ngram_embedding(inp.description);
+    // Thin wrapper over the split path (fix 29): the golden tests pin
+    // this interface; the resolver uses precompute_query + assemble_fast
+    // to avoid re-embedding the description per candidate.
+    let query = precompute_query(inp.description);
     let cand_emb = ngram_embedding(inp.candidate_text);
-    out[8..72].copy_from_slice(&desc_emb);
-    out[72..136].copy_from_slice(&cand_emb);
-    out[136] = dot(&desc_emb, &cand_emb);
+    assemble_fast(
+        inp.bm25,
+        &query,
+        inp.candidate_text,
+        &cand_emb,
+        inp.role_intent_match,
+        inp.exact_name,
+        inp.candidate_w,
+        inp.candidate_h,
+        inp.candidate_center,
+        inp.viewport,
+        inp.enabled_visible,
+    )
+}
+
+/// Precomputed description side for one resolve() call (v1.2, fix 29).
+/// The description is identical for every candidate in a single resolve;
+/// computing its normalized form and embedding once instead of per
+/// candidate removes ~8x redundant tokenizer/embedding work.
+pub struct QuerySide {
+    /// Normalized description (for edit similarity).
+    pub norm: String,
+    /// 64-dim embedding of the normalized description.
+    pub emb: [f32; 64],
+}
+
+/// Precompute the query side once per resolve() call.
+pub fn precompute_query(desc: &str) -> QuerySide {
+    let norm = normalize_text(desc);
+    let emb = ngram_embedding_normalized(&norm);
+    QuerySide { norm, emb }
+}
+
+/// 64-dim embedding assuming `norm` is already normalized (avoids the
+/// redundant second normalization when the caller precomputed it).
+fn ngram_embedding_normalized(norm: &str) -> [f32; 64] {
+    let chars: Vec<char> = norm.chars().collect();
+    let mut acc = [0i32; EMBED_DIM];
+    for n in 1..=3usize {
+        if chars.len() < n {
+            continue;
+        }
+        for i in 0..=(chars.len() - n) {
+            let mut h: u64 = 0;
+            for &c in &chars[i..i + n] {
+                let mut cbuf = [0u8; 4];
+                for &b in c.encode_utf8(&mut cbuf).as_bytes() {
+                    h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(FX_MULT);
+                }
+            }
+            let idx = ((h >> 1) % EMBED_DIM as u64) as usize;
+            let sign = if h & 1 == 0 { 1i32 } else { -1i32 };
+            acc[idx] += sign;
+        }
+    }
+    l2_normalize_f64(&acc)
+}
+
+/// Assemble with a precomputed query side and a precomputed candidate
+/// embedding (v1.2, fix 29). `cand_norm` is the normalized candidate
+/// text (name + visible text under schema v2); `cand_emb` is its 64-dim
+/// embedding (the resolver passes the cached value from `emb_cache`,
+/// avoiding a recompute). Jaccard and edit similarity still need the
+/// normalized strings; those are cheap relative to the embedding.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_fast(
+    bm25: f64,
+    query: &QuerySide,
+    cand_norm: &str,
+    cand_emb: &[f32; 64],
+    role_intent_match: bool,
+    exact_name: bool,
+    candidate_w: f64,
+    candidate_h: f64,
+    candidate_center: (f64, f64),
+    viewport: (f64, f64),
+    enabled_visible: bool,
+) -> [f32; FEATURE_DIM] {
+    let mut out = [0.0f32; FEATURE_DIM];
+    out[0] = finite_f32(bm25, -10.0).max(-10.0);
+    out[1] = finite_f32(jaccard_token_overlap(&query.norm, cand_norm), 0.0).clamp(0.0, 1.0);
+    out[2] = finite_f32(edit_similarity(&query.norm, cand_norm), 0.0).clamp(0.0, 1.0);
+    out[3] = f32::from(role_intent_match);
+    out[4] = f32::from(exact_name);
+    out[5] = finite_f32(log_area_norm(candidate_w, candidate_h), 0.0).clamp(0.0, 1.0);
+    out[6] = finite_f32(position_prior(candidate_center, viewport), 0.0).clamp(0.0, 1.0);
+    out[7] = f32::from(enabled_visible);
+    out[8..72].copy_from_slice(&query.emb);
+    out[72..136].copy_from_slice(cand_emb);
+    out[136] = dot(&query.emb, cand_emb);
     out
 }
 
@@ -909,12 +1024,13 @@ mod tests {
         assert!(check_schema_version(0).is_err());
         assert!(check_schema_version(FEATURE_SCHEMA_VERSION + 1).is_err());
         assert!(check_schema_version(u32::MAX).is_err());
-        let err = check_schema_version(2).unwrap_err();
+        // v1.2: schema is now 2; version 1 (the old name-only schema) is refused.
+        let err = check_schema_version(1).unwrap_err();
         assert_eq!(
             err,
             SchemaMismatch {
                 expected: FEATURE_SCHEMA_VERSION,
-                got: 2
+                got: 1
             }
         );
     }

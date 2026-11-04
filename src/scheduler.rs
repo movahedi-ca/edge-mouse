@@ -303,6 +303,11 @@ pub enum ButtonPlan {
     Click { dwell_ms: f64 },
     /// Double-click: move, hover, press/release twice.
     DoubleClick { dwell_ms: f64, inter_ms: f64 },
+    /// Scroll: move, then emit `ticks` vertical wheel events (XTest
+    /// button 4 = wheel up, button 5 = wheel down). Positive ticks
+    /// scroll down, negative scroll up. v1.2, fix 11: a Scroll gesture
+    /// used to plan ButtonPlan::None and send no wheel events at all.
+    Scroll { ticks: i32 },
 }
 
 /// A fully planned gesture: path geometry plus the nominal timing the
@@ -427,7 +432,9 @@ pub fn plan_gesture(
     frame_ms: f64,
 ) -> Result<PlannedEmit> {
     let params = profile.params();
-    let mut rng = XorShift64::with_salt(seed);
+    // v1.2, fix 14: from_seed, not with_salt. The seed must fully
+    // determine the trajectory; with_salt mixed wall-clock time.
+    let mut rng = XorShift64::from_seed(seed);
 
     let (points, mt_ms, samples, spacing_ms, spacing_noise, hover_ms, button) = if params.legacy {
         let (hz, dz) = rng.gauss_pair();
@@ -437,7 +444,13 @@ pub fn plan_gesture(
         let n = pts.len().max(2);
         let base_ms = (1.2 / total.max(1.0)).clamp(0.003, 0.008) * 1000.0;
         let button = match kind {
-            GestureKind::Move | GestureKind::Scroll => ButtonPlan::None,
+            GestureKind::Move => ButtonPlan::None,
+            // v1.2, fix 11: Scroll used to plan ButtonPlan::None and send
+            // no wheel events at all. Direction follows the gesture vector
+            // (down when to.y >= from.y); 3 ticks is the default scroll.
+            GestureKind::Scroll => ButtonPlan::Scroll {
+                ticks: if to.1 >= from.1 { 3 } else { -3 },
+            },
             GestureKind::Drag => ButtonPlan::DownThroughMove,
             GestureKind::Click => ButtonPlan::Click {
                 dwell_ms: params.dwell.sample(dz),
@@ -462,7 +475,13 @@ pub fn plan_gesture(
         let frame = frame_ms.max(1.0);
         let n = ((mt / frame).round() as usize).max(2);
         let button = match kind {
-            GestureKind::Move | GestureKind::Scroll => ButtonPlan::None,
+            GestureKind::Move => ButtonPlan::None,
+            // v1.2, fix 11: Scroll used to plan ButtonPlan::None and send
+            // no wheel events at all. Direction follows the gesture vector
+            // (down when to.y >= from.y); 3 ticks is the default scroll.
+            GestureKind::Scroll => ButtonPlan::Scroll {
+                ticks: if to.1 >= from.1 { 3 } else { -3 },
+            },
             GestureKind::Drag => ButtonPlan::DownThroughMove,
             GestureKind::Click => ButtonPlan::Click {
                 dwell_ms: params.dwell.sample(dz),
@@ -527,6 +546,18 @@ fn xtest_button(conn: &RustConnection, root: Window, press: bool) -> Result<()> 
     Ok(())
 }
 
+/// Emit one vertical wheel tick via XTest (button 4 = up, button 5 =
+/// down). v1.2, fix 11.
+fn xtest_wheel(conn: &RustConnection, root: Window, down: bool) -> Result<()> {
+    let ev = if down { 5 } else { 4 };
+    conn.xtest_fake_input(ev, 1, CURRENT_TIME, root, 0, 0, 0)
+        .context("XTest wheel press")?;
+    conn.xtest_fake_input(ev, 0, CURRENT_TIME, root, 0, 0, 0)
+        .context("XTest wheel release")?;
+    conn.flush().context("XTest flush")?;
+    Ok(())
+}
+
 /// Emit one planned gesture against absolute CLOCK_MONOTONIC deadlines.
 ///
 /// `check` is the SEC-1 gate (reject, never clamp); `on_frame` runs after
@@ -549,7 +580,8 @@ fn emit_inner(
     let total = cursor.total();
     let n = plan.samples.max(2);
     let inv_last = 1.0 / ((n - 1) as f64);
-    let mut rng = XorShift64::with_salt(plan.seed ^ 0x9E37_79B9_7F4A_7C15);
+    // v1.2, fix 14: from_seed, not with_salt (see plan_gesture).
+    let mut rng = XorShift64::from_seed(plan.seed ^ 0x9E37_79B9_7F4A_7C15);
     let mut accum = ResidualAccum::new();
     let mut tremor = OuTremor::new(60.0, 0.5);
     let mut deadline = monotonic_now();
@@ -562,7 +594,8 @@ fn emit_inner(
         let (ex, ey) = plan.exact_end;
         check(ex, ey)?;
         xtest_motion(conn, root, ex, ey)?;
-        conn.flush().context("XTest flush")?;
+        // v1.2, fix 30: no flush here; the single post-gesture flush
+        // below covers it.
         on_frame();
         emitted += 1;
     } else {
@@ -622,7 +655,10 @@ fn emit_inner(
 
             if last_sent != Some((rx, ry)) || i + 1 == n {
                 xtest_motion(conn, root, rx, ry)?;
-                conn.flush().context("XTest flush")?;
+                // v1.2, fix 30: no per-point flush. X11 is buffered by
+                // design; a flush per pixel is a synchronous round trip
+                // per point. on_frame() still runs per point for the
+                // drift detector; the socket flush happens once below.
                 on_frame();
                 last_sent = Some((rx, ry));
                 emitted += 1;
@@ -630,12 +666,23 @@ fn emit_inner(
         }
     }
 
+    // Single flush for the whole motion phase (fix 30). The button phase
+    // below flushes its own events via xtest_button/xtest_wheel.
+    conn.flush().context("XTest flush")?;
+
     // Button phase continues the same absolute-deadline schedule
     // (hover -> press -> dwell -> release).
     match plan.button {
         ButtonPlan::None => {}
         ButtonPlan::DownThroughMove => {
             xtest_button(conn, root, false)?;
+        }
+        // v1.2, fix 11: Scroll gestures emit real wheel events.
+        ButtonPlan::Scroll { ticks } => {
+            let down = ticks >= 0;
+            for _ in 0..ticks.unsigned_abs() {
+                xtest_wheel(conn, root, down)?;
+            }
         }
         ButtonPlan::Click { dwell_ms } => {
             deadline = deadline_add_ms(&deadline, plan.hover_ms);
@@ -819,6 +866,8 @@ impl InputThread {
                         rect,
                         frame_seq: 0,
                         shutdown: false,
+                        pending_rect: None,
+                        pending_query: false,
                     }
                     .run()
                 }
@@ -882,6 +931,13 @@ struct InputRunner {
     rect: WindowRect,
     frame_seq: u64,
     shutdown: bool,
+    /// v1.2, fix 7: a SetRect/QueryPointer that arrives mid-gesture is
+    /// STASHED here, not dropped. The old on_frame popped the command
+    /// and `break`ed, deleting it despite the "deferred" comment; SEC-1
+    /// then kept the stale rect for the whole gesture. The stash is
+    /// applied right after the gesture completes.
+    pending_rect: Option<WindowRect>,
+    pending_query: bool,
 }
 
 impl InputRunner {
@@ -945,18 +1001,28 @@ impl InputRunner {
         let side_rx = &self.side_rx;
         let runner_state = &self.state;
         let frame_seq = &mut self.frame_seq;
+        let pending_rect = &mut self.pending_rect;
+        let pending_query = &mut self.pending_query;
         let check_rect = self.rect;
         let check = |x: i32, y: i32| check_in_window(Some(&check_rect), x, y);
         let mut on_frame = || {
             // Drain side effects between flushed frames; no mutex held
             // across sleeps (the runner owns everything here). Pointer
             // queries and rect changes that arrive mid-gesture are
-            // deferred to the next between-gesture drain: the side ring
-            // is a consumer, so re-queueing is impossible.
+            // STASHED (fix 7), not dropped: the side ring is a consumer,
+            // so re-queueing is impossible, and the old `break` deleted
+            // the command despite the "deferred" comment.
             let mut rx = side_rx.borrow_mut();
             for _ in 0..DRAIN_BUDGET {
                 match rx.pop() {
-                    Ok(SideEffect::QueryPointer) | Ok(SideEffect::SetRect(_)) => break,
+                    Ok(SideEffect::QueryPointer) => {
+                        *pending_query = true;
+                        break;
+                    }
+                    Ok(SideEffect::SetRect(rect)) => {
+                        *pending_rect = Some(rect);
+                        break;
+                    }
                     Ok(SideEffect::Ping) => {}
                     Err(_) => break,
                 }
@@ -968,6 +1034,22 @@ impl InputRunner {
             runner_state.store(s);
         };
         let report = emit_inner(&self.conn, self.root, &check, plan, &mut on_frame);
+        // Apply the deferred side effects (fix 7): the stashed rect takes
+        // effect before the next gesture's SEC-1 check; the stashed query
+        // runs now.
+        if let Some(rect) = self.pending_rect.take() {
+            self.rect = rect;
+        }
+        if std::mem::replace(&mut self.pending_query, false) {
+            if let Ok(cookie) = self.conn.query_pointer(self.root) {
+                if let Ok(r) = cookie.reply() {
+                    let mut s = self.state.load();
+                    s.x = i32::from(r.root_x);
+                    s.y = i32::from(r.root_y);
+                    self.state.store(s);
+                }
+            }
+        }
         if report.is_ok() {
             // Latest-value broadcast: the gesture ended exactly on target.
             self.broadcast_frame(plan.exact_end.0, plan.exact_end.1);

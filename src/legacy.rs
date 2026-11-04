@@ -33,7 +33,10 @@ const RESAMPLE_SPACING_PX: f64 = 4.0;
 pub fn legacy_duration_ms(total_arc_px: f64) -> f64 {
     let n = total_arc_px / 4.0 + 1.0;
     let base = (1.2 / total_arc_px.max(1.0)).clamp(0.003, 0.008);
-    n * base * 1000.0
+    // v1.2: sample 0 emits with no sleep (the emit loop only sleeps for
+    // i > 0), so wall time is (n-1)*base, not n*base. The old formula
+    // reported ~2x the actual duration for short moves (n = 2).
+    (n - 1.0).max(0.0) * base * 1000.0
 }
 
 /// Overdue latch for absolute-deadline emission: a sample more than this
@@ -113,6 +116,17 @@ impl XorShift64 {
         // for xorshift64*) and warm up the state once to diffuse low timestamp bits.
         s.0 |= 1;
         let _ = s.next_u64();
+        s
+    }
+
+    /// Deterministic seed: NO wall-clock mixing. `plan_gesture` and
+    /// `emit_inner` must use this so `PlannedEmit.seed` fully determines
+    /// the trajectory and timing noise (v1.2, fix 14). `with_salt` mixes
+    /// `SystemTime::now()`, which broke the determinism contract.
+    /// `seed | 1` avoids the zero absorbing state.
+    pub fn from_seed(seed: u64) -> Self {
+        let mut s = Self(seed | 1);
+        let _ = s.next_u64(); // warm up once, same as with_salt
         s
     }
 

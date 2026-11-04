@@ -48,7 +48,7 @@ use x11rb::rust_connection::RustConnection;
 use crate::coords::{to_screen, FrameTransform, MainViewportCss, RootDevicePx};
 use crate::legacy::WindowRect;
 use crate::perceive::GenerationSnapshot;
-use crate::predicates::{eval as eval_predicate, EvalCtx, Predicate, PredicateValue};
+use crate::predicates::{eval_with_target, EvalCtx, Predicate, PredicateValue};
 use crate::resolver::{
     normalize_desc, EngineConfig, Gates, Hit, MissReason, Resolution, ResolveOpts, ResolverEngine,
     Rng01,
@@ -59,8 +59,8 @@ use crate::scheduler::{
 };
 use crate::telemetry::{RunTelemetry, Stage, Timer};
 use crate::vision::{
-    box_filter_9x8, check_against, dhash_9x8, Baseline, Capture, DamageProbe, OcrOutcome, Verdict,
-    VerifierStats, VerifyEvidence, VerifyHooks,
+    box_filter_9x8, check_against, dhash_9x8, mean_luma_9x8, Baseline, Capture, DamageProbe,
+    OcrOutcome, Verdict, VerifierStats, VerifyEvidence, VerifyHooks,
 };
 
 // ---------------------------------------------------------------------------
@@ -158,6 +158,12 @@ pub trait Actuator {
 pub trait Capturer {
     fn capture_region(&mut self, region: (u32, u32, u32, u32)) -> Result<Capture, String>;
     fn full_shot(&mut self) -> Option<Vec<u8>>;
+    /// v1.2, fix 2b: redacted full screenshot for escalation. The default
+    /// calls full_shot() (no redaction); production capturers MUST
+    /// override to zero password-field boxes before encoding.
+    fn redacted_full_shot(&mut self, _password_boxes: &[(u32, u32, u32, u32)]) -> Option<Vec<u8>> {
+        self.full_shot()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +286,12 @@ struct LastStep {
     /// screenshot overlay (honest miss review).
     click_px: (f64, f64),
     target_box_px: (f64, f64, f64, f64),
+    /// v1.2, fix 16: pre-press region baseline (dHash + mean luma),
+    /// captured in dispatch BEFORE the click. verify() compares the
+    /// post-action frame against this, not against another post-action
+    /// frame.
+    pre_hash: u64,
+    pre_luma: f32,
 }
 
 /// Per-step wall-clock timings the benchmark report needs.
@@ -375,16 +387,29 @@ impl<P: Perception, A: Actuator, C: Capturer> EngineDriver<P, A, C> {
         // Identity chain: coordinates are already main-viewport CSS px,
         // normalized once at tree-insertion time (same contract as
         // feed_resolver).
+        //
+        // v1.2, fix 6: the chain carries the node's real DPR, not a
+        // hardcoded 1.0. The old code refused 8-CSS-px targets at 2x
+        // (16 physical px, above the 12px floor) as "too small".
+        // Note: all nodes in a snapshot share the frame DPR in practice;
+        // we take it from the first node for the chain.
+        let dpr = snap.nodes.first().map(|n| n.dpr).unwrap_or(1.0);
         let chain = [FrameTransform {
             scroll: (0.0, 0.0),
             content_origin: (0.0, 0.0),
             nested_offset: (0.0, 0.0),
             css_scale: 1.0,
             transform_origin: (0.0, 0.0),
-            dpr: 1.0,
+            dpr,
         }];
         for n in &snap.nodes {
             if self.failed_ids.contains(&n.backend_node_id) {
+                continue;
+            }
+            // v1.2, fix 2d: password fields never enter the resolver
+            // cascade (Tier-0 already culls them; the cascade must not
+            // resolve-and-click them).
+            if n.is_password {
                 continue;
             }
             // Corrupt node geometry is skipped loudly (counted), never
@@ -418,8 +443,8 @@ impl<P: Perception, A: Actuator, C: Capturer> EngineDriver<P, A, C> {
         pred: &Predicate,
         target: Option<u64>,
     ) -> PredicateValue {
-        let mut ctx = data.eval_ctx.clone();
-        ctx.target_node_id = target;
+        // v1.2, fix 32: no clone; eval_with_target borrows and takes the
+        // target id as a parameter.
         // HasText also matches against the full page text (the DOM snapshot
         // only carries interactive elements; headings and other static text
         // live in page_text).
@@ -428,7 +453,7 @@ impl<P: Perception, A: Actuator, C: Capturer> EngineDriver<P, A, C> {
                 return PredicateValue::Bool(true);
             }
         }
-        eval_predicate(pred, &ctx)
+        eval_with_target(pred, &data.eval_ctx, target)
     }
 
     /// Region for the verifier: the hit's node box in device px.
@@ -465,22 +490,34 @@ impl<P: Perception, A: Actuator, C: Capturer> EngineDriver<P, A, C> {
         Some((tl.0.max(0.0) as u32, tl.1.max(0.0) as u32, w, h))
     }
 
-    fn shortlist_text(&mut self, desc: &str) -> Vec<String> {
-        match self.resolver.natural_top_k(desc, 8) {
-            Ok(top) => top
-                .iter()
-                .map(|(i, score, _)| {
-                    let c = &self.resolver.candidates()[*i];
-                    format!("{} {:?} score={:.2}", c.backend_node_id, c.role, score)
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+    /// Render the escalation shortlist from the resolver's stashed
+    /// top-k (v1.2, fix 25). The old version called natural_top_k,
+    /// re-running the BM25 scan + sort + assemble that resolve() had
+    /// just done.
+    fn shortlist_text(&self) -> Vec<String> {
+        self.resolver
+            .last_ranked()
+            .iter()
+            .map(|r| {
+                let c = &self.resolver.candidates()[r.idx];
+                format!("{} {:?} score={:.2}", c.backend_node_id, c.role, r.score)
+            })
+            .collect()
     }
 
     /// Run one (describe, predicate) task through the full pipeline with
     /// journaling. One step per call; the journal path persists the run.
+    ///
+    /// v1.2, fix 23: per-task state is reset here. The driver is built
+    /// once and run_single is called per task; without the reset,
+    /// failed_ids accumulated forever (a node that missed in task 1 was
+    /// excluded from every later task) and `dispatched` stayed true,
+    /// corrupting the second task's already_satisfied flag.
     pub fn run_single(&mut self, spec: &TaskSpec, journal_path: &str) -> TaskReport {
+        self.failed_ids.clear();
+        self.dispatched = false;
+        self.last = None;
+        self.timings = StepTimings::default();
         let book = [Step {
             describe: spec.describe.clone(),
             predicate: spec.predicate.clone(),
@@ -535,24 +572,43 @@ impl<P: Perception, A: Actuator, C: Capturer> EngineDriver<P, A, C> {
         use std::thread;
         use std::time::Duration;
 
+        // v1.2, fix 24: the fingerprint includes node geometry (at/wh),
+        // not just name+text. The old fingerprint considered a relayout
+        // that moved every button (same names, same texts, new geometry)
+        // as "stable".
         fn fingerprint(data: &PerceptionData) -> (usize, u64) {
             let mut h = DefaultHasher::new();
             let n = data.snapshot.nodes.len();
             for node in &data.snapshot.nodes {
                 node.name.hash(&mut h);
                 node.text.hash(&mut h);
+                // Geometry: relayouts change the fingerprint.
+                node.at.0.to_bits().hash(&mut h);
+                node.at.1.to_bits().hash(&mut h);
+                node.wh.0.to_bits().hash(&mut h);
+                node.wh.1.to_bits().hash(&mut h);
             }
             (n, h.finish())
         }
 
+        // v1.2, fix 24: compare immediately first; only sleep when the
+        // snapshots differ. The old code slept 500ms unconditionally
+        // before the first compare, imposing a >=500ms floor on every
+        // verification (worst case 8 x 500ms = 4s).
         let mut prev = self.perception.snapshot()?;
         let mut prev_fp = fingerprint(&prev);
-        for _ in 0..8 {
-            thread::sleep(Duration::from_millis(500));
+        for attempt in 0..8 {
             let cur = self.perception.snapshot()?;
             let cur_fp = fingerprint(&cur);
             if cur_fp == prev_fp {
                 return Ok(cur);
+            }
+            // Unstable: back off only now, not on the happy path.
+            if attempt > 0 {
+                thread::sleep(Duration::from_millis(500));
+            } else {
+                // First mismatch: one short settle before re-checking.
+                thread::sleep(Duration::from_millis(100));
             }
             prev = cur;
             prev_fp = cur_fp;
@@ -682,12 +738,14 @@ impl<P: Perception, A: Actuator, C: Capturer> StepDriver for EngineDriver<P, A, 
         };
         let resolution = self.resolver.resolve(&step.describe, &opts, &mut self.rng);
         let resolve_nanos = t.elapsed_nanos();
-        let shortlist = self.shortlist_text(&step.describe);
+        let shortlist = self.shortlist_text();
         let hit = match resolution {
             Resolution::Hit(h) => {
                 let stage = match h.stage {
                     crate::resolver::Stage::Cache => Stage::Cache,
-                    crate::resolver::Stage::Exact => Stage::Bm25,
+                    // v1.2, fix 19: Exact has its own telemetry variant now;
+                    // the old code mislabeled it as Bm25.
+                    crate::resolver::Stage::Exact => Stage::Exact,
                     crate::resolver::Stage::Bm25 => Stage::Bm25,
                     crate::resolver::Stage::Ranker => Stage::Ranker,
                 };
@@ -719,6 +777,38 @@ impl<P: Perception, A: Actuator, C: Capturer> StepDriver for EngineDriver<P, A, 
                 hit.backend_node_id
             ));
         }
+
+        // v1.2, fix 16: capture the PRE-PRESS region baseline (dHash +
+        // mean luma) BEFORE the click. The old code hashed a post-action
+        // frame in verify() and diffed two post-action frames.
+        let pre_region = data
+            .snapshot
+            .by_backend
+            .get(&hit.backend_node_id)
+            .and_then(|&i| {
+                let n = &data.snapshot.nodes[i];
+                let tl = to_screen(
+                    MainViewportCss(n.at.0, n.at.1),
+                    self.geom.zoom,
+                    self.geom.dpr,
+                    self.geom.window_origin,
+                )
+                .ok()?;
+                let scale = self.geom.zoom * self.geom.dpr;
+                let w = ((hit.w * scale).round() as u32).max(1);
+                let h = ((hit.h * scale).round() as u32).max(1);
+                Some((tl.0.max(0.0) as u32, tl.1.max(0.0) as u32, w, h))
+            });
+        let (pre_hash, pre_luma) = match pre_region {
+            Some(r) => match self.capturer.capture_region(r) {
+                Ok(c) => match box_filter_9x8(&c) {
+                    Ok(cells) => (dhash_9x8(&cells), mean_luma_9x8(&cells)),
+                    Err(_) => (0, 0.0),
+                },
+                Err(_) => (0, 0.0),
+            },
+            None => (0, 0.0),
+        };
 
         // 3. Actuate.
         let t = Timer::start();
@@ -764,15 +854,25 @@ impl<P: Perception, A: Actuator, C: Capturer> StepDriver for EngineDriver<P, A, 
             shortlist,
             click_px: rep.to_px,
             target_box_px,
+            pre_hash,
+            pre_luma,
         });
         Ok(hit.backend_node_id)
     }
 
     fn verify(&mut self, step: &Step) -> Verdict {
         let t_all = Instant::now();
-        let (hit_id, pred_before, region) = match &self.last {
+        // v1.2, fix 16: the baseline is the PRE-PRESS capture from
+        // dispatch (dHash + mean luma), not a post-action frame.
+        let (hit_id, pred_before, region, pre_hash, pre_luma) = match &self.last {
             Some(l) => match self.verify_region(&l.hit) {
-                Some(region) => (l.hit.backend_node_id, l.pred_before.clone(), region),
+                Some(region) => (
+                    l.hit.backend_node_id,
+                    l.pred_before.clone(),
+                    region,
+                    l.pre_hash,
+                    l.pre_luma,
+                ),
                 // Corrupt geometry: cannot verify, never fabricate.
                 None => return Verdict::Inconclusive,
             },
@@ -785,23 +885,13 @@ impl<P: Perception, A: Actuator, C: Capturer> StepDriver for EngineDriver<P, A, 
             Ok(d) => d,
             Err(_) => return Verdict::Inconclusive,
         };
-        let mut ctx = data.eval_ctx.clone();
-        ctx.target_node_id = Some(hit_id);
-
-        // Post-action region anchor (the pre-action predicate state is
-        // already established by the runner's predicate_now gate).
-        let region_hash = match self.capturer.capture_region(region).and_then(|c| {
-            box_filter_9x8(&c)
-                .map(|cells| dhash_9x8(&cells))
-                .map_err(|e| format!("dhash: {e}"))
-        }) {
-            Ok(h) => h,
-            Err(_) => return Verdict::Inconclusive,
-        };
+        // v1.2, fix 32: no clone; the hook passes the target id explicitly.
+        let ctx = &data.eval_ctx;
         let baseline = Baseline {
             predicate_before: pred_before,
             region,
-            region_hash,
+            region_hash: pre_hash,
+            region_luma: pre_luma,
         };
 
         let ev: VerifyEvidence = {
@@ -825,7 +915,8 @@ impl<P: Perception, A: Actuator, C: Capturer> StepDriver for EngineDriver<P, A, 
                             return PredicateValue::Bool(true);
                         }
                     }
-                    eval_predicate(p, &ctx)
+                    // v1.2, fix 32: no EvalCtx clone; pass the target id.
+                    eval_with_target(p, ctx, Some(hit_id))
                 },
                 capture: &capture,
                 settle,
@@ -871,8 +962,21 @@ impl<P: Perception, A: Actuator, C: Capturer> StepDriver for EngineDriver<P, A, 
         }
     }
 
+    fn note_retry(&mut self) {
+        // v1.2, fix 19: the retry path now records itself.
+        self.telemetry.inc_retries();
+    }
+
     fn escalation_shot(&mut self) -> Option<Vec<u8>> {
-        self.capturer.full_shot()
+        // v1.2, fix 2b: redact password fields before the shot leaves.
+        // The old code called full_shot() directly, leaving password
+        // values visible in escalation screenshots.
+        let boxes = self
+            .last
+            .as_ref()
+            .map(|l| l.data.eval_ctx.password_boxes())
+            .unwrap_or_default();
+        self.capturer.redacted_full_shot(&boxes)
     }
 
     fn shortlist(&self) -> Vec<String> {

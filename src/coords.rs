@@ -57,7 +57,7 @@ pub struct FrameTransform {
 pub enum CoordError {
     /// A coordinate input was NaN or infinite.
     NonFiniteInput { field: &'static str },
-    /// The CSS scale was NaN, infinite, or zero.
+    /// The CSS scale was NaN, infinite, zero, or negative.
     InvalidScale { field: &'static str },
 }
 
@@ -68,7 +68,10 @@ impl std::fmt::Display for CoordError {
                 write!(f, "non-finite coordinate input: {field}")
             }
             CoordError::InvalidScale { field } => {
-                write!(f, "invalid CSS scale (NaN, infinite, or zero): {field}")
+                write!(
+                    f,
+                    "invalid CSS scale (NaN, infinite, zero, or negative): {field}"
+                )
             }
         }
     }
@@ -100,7 +103,9 @@ pub fn document_to_main_viewport(
     let (mut x, mut y) = (finite(doc.0, "doc.x")?, finite(doc.1, "doc.y")?);
     for t in chain {
         let scale = finite(t.css_scale, "css_scale")?;
-        if scale == 0.0 {
+        // A negative scale mirrors the coordinate to the wrong side of the
+        // screen; only strictly positive scales are meaningful. (M1)
+        if scale <= 0.0 {
             return Err(CoordError::InvalidScale { field: "css_scale" });
         }
         let (sx, sy) = (
@@ -148,6 +153,11 @@ pub fn to_screen(
     if !(scale.is_finite() && scale > 0.0) {
         return Err(CoordError::InvalidScale { field: "zoom*dpr" });
     }
+    // Rounding contract (M2): f64::round is round-half-away-from-zero, so a
+    // CSS value landing exactly on a .5 device-px boundary rounds UP for
+    // positive coordinates and DOWN for negative ones. Deterministic and
+    // pinned by the golden tests; keep it in mind if a future CDP source
+    // feeds sub-pixel viewport coordinates with negative window origins.
     Ok(RootDevicePx(
         (ox + vx * scale).round(),
         (oy + vy * scale).round(),
@@ -184,7 +194,8 @@ pub fn main_viewport_to_document(
     let (mut x, mut y) = (finite(v.0, "viewport.x")?, finite(v.1, "viewport.y")?);
     for t in chain.iter().rev() {
         let scale = finite(t.css_scale, "css_scale")?;
-        if scale == 0.0 {
+        // Same guard as the forward walk: negative scales mirror.
+        if scale <= 0.0 {
             return Err(CoordError::InvalidScale { field: "css_scale" });
         }
         let (sx, sy) = (
@@ -513,6 +524,75 @@ mod tests {
         }
         assert!(to_screen(MainViewportCss(f64::NAN, 1.0), 1.0, 1.0, origin).is_err());
         assert!(to_screen(vp, 1.0, 1.0, RootDevicePx(f64::INFINITY, 0.0)).is_err());
+    }
+
+    #[test]
+    fn negative_css_scale_is_rejected() {
+        // M1 regression: a negative scale mirrors the coordinate to the
+        // wrong side of the screen. The old `scale == 0.0` guard let it
+        // through; only strictly positive scales are meaningful.
+        for bad in [-2.0f64, -0.5, -1e-9] {
+            let mut fwd = identity_frame();
+            fwd.css_scale = bad;
+            assert_eq!(
+                document_to_main_viewport(FrameDocumentCss(100.0, 100.0), &[fwd]),
+                Err(CoordError::InvalidScale { field: "css_scale" }),
+                "forward walk accepted css_scale={bad}"
+            );
+            assert_eq!(
+                main_viewport_to_document(MainViewportCss(100.0, 100.0), &[fwd]),
+                Err(CoordError::InvalidScale { field: "css_scale" }),
+                "inverse walk accepted css_scale={bad}"
+            );
+        }
+        // Sanity: small positive scales still pass.
+        let mut tiny = identity_frame();
+        tiny.css_scale = 1e-9;
+        assert!(document_to_main_viewport(FrameDocumentCss(1.0, 1.0), &[tiny]).is_ok());
+    }
+
+    #[test]
+    fn scale_with_nonzero_scroll_golden() {
+        // T2: the scale-after-scroll ordering is the subtlest line of the
+        // transform. frame: scroll (20, 30), css_scale 2, origin (0,0),
+        // content origin (0,0). doc (100, 100):
+        // x = (100 - 20 - 0) * 2 + 0 + 0 + 0 = 160
+        // y = (100 - 30 - 0) * 2 + 0 + 0 + 0 = 140
+        let scaled = FrameTransform {
+            scroll: (20.0, 30.0),
+            content_origin: (0.0, 0.0),
+            nested_offset: (0.0, 0.0),
+            css_scale: 2.0,
+            transform_origin: (0.0, 0.0),
+            dpr: 1.0,
+        };
+        let vp = document_to_main_viewport(FrameDocumentCss(100.0, 100.0), &[scaled])
+            .expect("scale+scroll");
+        assert!((vp.0 - 160.0).abs() < 1e-9, "got {}", vp.0);
+        assert!((vp.1 - 140.0).abs() < 1e-9, "got {}", vp.1);
+        // Inverse: x = (160 - 0 - 0 - 0)/2 + 0 + 20 = 100.
+        let doc_back = main_viewport_to_document(vp, &[scaled]).expect("inverse");
+        assert!((doc_back.0 - 100.0).abs() < 1e-9);
+        assert!((doc_back.1 - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn half_pixel_rounding_boundaries() {
+        // M2/T3: f64::round is round-half-away-from-zero. Pin the boundary
+        // contract in both sign quadrants and at two DPRs.
+        let origin = RootDevicePx(0.0, 0.0);
+        // 0.25 CSS px at DPR 2.0 -> 0.5 device px -> rounds to 1.
+        let dev = to_screen(MainViewportCss(0.25, 0.25), 1.0, 2.0, origin).expect("dpr2");
+        assert_eq!(dev.0, 1.0);
+        assert_eq!(dev.1, 1.0);
+        // 0.25 CSS px at DPR 1.0 -> 0.25 device px -> rounds to 0.
+        let dev = to_screen(MainViewportCss(0.25, 0.25), 1.0, 1.0, origin).expect("dpr1");
+        assert_eq!(dev.0, 0.0);
+        // Negative window origin: -0.5 device px rounds away from zero to -1.
+        let neg_origin = RootDevicePx(-0.75, -0.75);
+        let dev = to_screen(MainViewportCss(0.25, 0.25), 1.0, 1.0, neg_origin).expect("neg");
+        assert_eq!(dev.0, -1.0, "got {}", dev.0);
+        assert_eq!(dev.1, -1.0, "got {}", dev.1);
     }
 
     fn three_level_links() -> Vec<FrameLink> {

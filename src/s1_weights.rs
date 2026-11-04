@@ -12,7 +12,8 @@
 //! `.bin` layout (written FROM THE STATE DICT, never round-tripped
 //! through an exporter's transpose):
 //! ```text
-//! header 16B LE: "S1MW" | format_version u16=1 | feature_schema u16=1
+//! header 16B LE: "S1MW" | format_version u16=1 | feature_schema u16=2
+//! (v1.2: schema 2 = candidate name + visible text; schema 1 was name-only)
 //!                | n_train_params u32=10945 | pad_dim u16=144 | reserved u16=0
 //! body f32 LE: w1 64x144 padded rows (9216) | b1 64 | w2 32x64 (2048)
 //!              | b2 32 | w3 32 | b3 1 | inv_temp 1
@@ -669,9 +670,9 @@ mod tests {
     #[test]
     fn reject_bad_schema() {
         let mut bad = GOLDEN_BIN.to_vec();
-        bad[6] = 2; // feature_schema u16 LE low byte
+        bad[6] = 3; // feature_schema u16 LE low byte (v1.2: schema is now 2)
         let err = S1MouseWeights::load_from_bytes(&bad).unwrap_err();
-        assert_eq!(err, LoadError::BadSchema { got: 2 });
+        assert_eq!(err, LoadError::BadSchema { got: 3 });
     }
 
     #[test]

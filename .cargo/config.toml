@@ -1,0 +1,5 @@
+# v1.2 (C1): target the x86-64-v3 baseline so the f32 GEMV, luma, and
+# embedding loops get AVX2. This crate has no clang/mold linker
+# requirements (unlike the bridge repo), so rustflags alone are safe.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
