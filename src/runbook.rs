@@ -192,6 +192,8 @@ pub struct RunJournal {
     pub book_hash: String,
     pub cursor: usize,
     /// "dispatched:step{i}:attempt{k}" before the action;
+    /// "emit_confirmed:step{i}:attempt{k}" immediately after the X11 emit
+    /// returns (before verify);
     /// "confirmed:step{i}" / "unconfirmed:step{i}:{verdict}" after;
     /// "escalated:..." / "parked:..." / "checkpoint:..." at stops.
     pub last_outcome: Option<String>,
@@ -495,14 +497,35 @@ fn allowlist_violation(
     None
 }
 
-/// Journal markers with no confirmed outcome: the action may have run,
-/// the outcome was never recorded.
+/// Journal marker written immediately after `driver.dispatch` returns Ok:
+/// the X11 emit completed, verify has not run yet. Distinct from the
+/// pre-emit "dispatched" marker, which cannot tell crash-before-emit from
+/// crash-after-emit.
+fn emit_confirmed_marker(last_outcome: &Option<String>, i: usize) -> bool {
+    match last_outcome.as_deref() {
+        Some(s) => s.starts_with(&format!("emit_confirmed:step{i}:")),
+        None => false,
+    }
+}
+
+/// Post-verify "unconfirmed" markers: the emit happened, the outcome was
+/// never recorded.
 fn unconfirmed_marker(last_outcome: &Option<String>, i: usize) -> bool {
     match last_outcome.as_deref() {
-        Some(s) => {
-            s.starts_with(&format!("dispatched:step{i}:"))
-                || s.starts_with(&format!("unconfirmed:step{i}:"))
-        }
+        Some(s) => s.starts_with(&format!("unconfirmed:step{i}:")),
+        None => false,
+    }
+}
+
+/// Pre-emit "dispatched" marker with NO following "emit_confirmed": the
+/// journal went out before the X11 call, so the action may never have
+/// happened. Safe to re-plan (execute_step re-checks AlreadySatisfied
+/// before dispatching).
+fn dispatched_unemitted_marker(last_outcome: &Option<String>, i: usize) -> bool {
+    match last_outcome.as_deref() {
+        // "emit_confirmed:..." does not start with "dispatched:", so the
+        // prefix test alone distinguishes the two crash points.
+        Some(s) => s.starts_with(&format!("dispatched:step{i}:")),
         None => false,
     }
 }
@@ -599,9 +622,19 @@ fn drive(
             return RunOutcome::Checkpoint { step: i };
         }
 
-        // Restart reconciliation: dispatched (or verified) but unconfirmed.
-        // Re-read the predicate; never blindly repeat the action.
-        if unconfirmed_marker(&state.journal.last_outcome, i) {
+        // Restart reconciliation.
+        // - "dispatched" WITHOUT "emit_confirmed": the journal went out
+        //   before the X11 emit, so the action may never have happened.
+        //   Safe to re-plan: fall through to execute_step, which re-checks
+        //   AlreadySatisfied before dispatching. No predicate re-read is
+        //   needed (there is nothing to reconcile: no confirmed emit).
+        // - "emit_confirmed" (or a post-verify "unconfirmed"): the emit
+        //   happened. Re-read the predicate; never blindly repeat.
+        if dispatched_unemitted_marker(&state.journal.last_outcome, i) {
+            // Fall through to execute_step: fresh plan.
+        } else if emit_confirmed_marker(&state.journal.last_outcome, i)
+            || unconfirmed_marker(&state.journal.last_outcome, i)
+        {
             match driver.predicate_now(&step.predicate) {
                 PredicateValue::Bool(true) => {
                     // The action landed before the kill. Never repeat it.
@@ -690,7 +723,17 @@ fn execute_step(
 
     // Attempt 0.
     let target = match driver.dispatch(step) {
-        Ok(id) => id,
+        Ok(id) => {
+            // The X11 emit returned: journal it BEFORE verify. On restart,
+            // "dispatched" without this marker means the emit may never
+            // have happened (safe to re-plan); with it, reconcile re-reads
+            // the predicate as today.
+            state.journal.last_outcome = Some(format!("emit_confirmed:step{i}:attempt0"));
+            if let Err(e) = persist(state, store) {
+                return StepResult::Park { reason: e };
+            }
+            id
+        }
         Err(e) => {
             return StepResult::Escalate {
                 reason: EscalateReason::DispatchRejected,
@@ -744,7 +787,13 @@ fn execute_step(
                 return StepResult::Park { reason: e };
             }
             let target2 = match driver.dispatch(step) {
-                Ok(id) => id,
+                Ok(id) => {
+                    state.journal.last_outcome = Some(format!("emit_confirmed:step{i}:attempt1"));
+                    if let Err(e) = persist(state, store) {
+                        return StepResult::Park { reason: e };
+                    }
+                    id
+                }
                 Err(e) => {
                     return StepResult::Escalate {
                         reason: EscalateReason::DispatchRejected,
@@ -1120,7 +1169,7 @@ mod tests {
     fn restart_after_dispatch_predicate_true_never_repeats() {
         let book = vec![step("s0")];
         let store = seeded_journal(&book, |j| {
-            j.last_outcome = Some("dispatched:step0:attempt0".to_string());
+            j.last_outcome = Some("emit_confirmed:step0:attempt0".to_string());
         });
         let mut driver = ScriptDriver::new();
         // Re-read finds the action landed.
@@ -1145,7 +1194,7 @@ mod tests {
     fn restart_after_dispatch_predicate_false_attempts_once() {
         let book = vec![step("s0")];
         let store = seeded_journal(&book, |j| {
-            j.last_outcome = Some("dispatched:step0:attempt0".to_string());
+            j.last_outcome = Some("emit_confirmed:step0:attempt0".to_string());
         });
         let mut driver = ScriptDriver::new();
         // Re-read: not landed. Pre-dispatch check: not satisfied. Verify: confirmed.
@@ -1173,7 +1222,7 @@ mod tests {
     fn restart_after_dispatch_predicate_unknown_escalates_never_repeats() {
         let book = vec![step("s0")];
         let store = seeded_journal(&book, |j| {
-            j.last_outcome = Some("dispatched:step0:attempt0".to_string());
+            j.last_outcome = Some("emit_confirmed:step0:attempt0".to_string());
         });
         let mut driver = ScriptDriver::new();
         driver.predicate_values.push_back(PredicateValue::Unknown);
@@ -1188,6 +1237,123 @@ mod tests {
         let outcome = resume(&book, &cfg, &mut state, &mut driver, &mut store);
         assert!(matches!(outcome, RunOutcome::Escalated(_)));
         assert!(driver.dispatches.is_empty(), "blind repeat after unknown!");
+    }
+
+    #[test]
+    fn restart_after_dispatched_without_emit_replans_fresh() {
+        // Crash point 1: the journal went out BEFORE the X11 emit, so the
+        // action may never have happened. Restart must re-plan (a fresh
+        // dispatch), not predicate-re-read and not escalate.
+        let book = vec![step("s0")];
+        let store = seeded_journal(&book, |j| {
+            j.last_outcome = Some("dispatched:step0:attempt0".to_string());
+        });
+        let mut driver = ScriptDriver::new();
+        // execute_step's AlreadySatisfied check: not satisfied.
+        driver
+            .predicate_values
+            .push_back(PredicateValue::Bool(false));
+        driver.verify_values.push_back(Verdict::Confirmed);
+        let cfg = cfg();
+        let mut store = store;
+        let mut state = RunState {
+            journal: store.load(&book_hash(&book)).unwrap(),
+            tier1_calls: 0,
+            strikes_on: None,
+            shot_ring: VecDeque::new(),
+        };
+        let outcome = resume(&book, &cfg, &mut state, &mut driver, &mut store);
+        assert!(matches!(outcome, RunOutcome::Complete));
+        // Exactly one fresh dispatch: the pre-crash dispatch never
+        // observably happened, so this is not a repeat.
+        assert_eq!(driver.dispatches, vec!["s0"]);
+    }
+
+    #[test]
+    fn restart_after_dispatched_without_emit_already_satisfied_skips() {
+        // Crash point 1, but the step is already satisfied: the re-plan
+        // must notice and never dispatch.
+        let book = vec![step("s0")];
+        let store = seeded_journal(&book, |j| {
+            j.last_outcome = Some("dispatched:step0:attempt0".to_string());
+        });
+        let mut driver = ScriptDriver::new();
+        driver
+            .predicate_values
+            .push_back(PredicateValue::Bool(true));
+        let cfg = cfg();
+        let mut store = store;
+        let mut state = RunState {
+            journal: store.load(&book_hash(&book)).unwrap(),
+            tier1_calls: 0,
+            strikes_on: None,
+            shot_ring: VecDeque::new(),
+        };
+        let outcome = resume(&book, &cfg, &mut state, &mut driver, &mut store);
+        assert!(matches!(outcome, RunOutcome::Complete));
+        assert!(driver.dispatches.is_empty(), "satisfied step was clicked!");
+    }
+
+    #[test]
+    fn execute_step_journals_emit_confirmed_between_dispatch_and_verify() {
+        // Regression pin for the crash-point ambiguity: the journal must
+        // show dispatched -> emit_confirmed -> confirmed, in that order.
+        // Without the fix, "dispatched" is followed directly by the
+        // post-verify marker and the two crash points are indistinguishable.
+        struct RecordingStore {
+            inner: MemStore,
+            seen: Vec<Option<String>>,
+        }
+        impl JournalStore for RecordingStore {
+            fn load(&self, book_hash: &str) -> Option<RunJournal> {
+                self.inner.load(book_hash)
+            }
+            fn save(&mut self, j: &RunJournal) -> Result<(), String> {
+                self.seen.push(j.last_outcome.clone());
+                self.inner.save(j)
+            }
+        }
+
+        let book = vec![step("s0")];
+        let mut store = RecordingStore {
+            inner: MemStore::new(),
+            seen: Vec::new(),
+        };
+        let mut driver = ScriptDriver::new();
+        driver.verify_values.push_back(Verdict::Confirmed);
+        let cfg = cfg();
+        let ctx = ExecCtx {
+            budget: 5,
+            cfg: &cfg,
+            book_len: 1,
+        };
+        let mut state = RunState {
+            journal: RunJournal {
+                run_id: "r".to_string(),
+                book_hash: book_hash(&book),
+                cursor: 0,
+                last_outcome: None,
+                profile_id: "p".to_string(),
+                origin: "portal.example".to_string(),
+                tree_generation: 0,
+                committed_steps: Vec::new(),
+                checkpoints: Vec::new(),
+            },
+            tier1_calls: 0,
+            strikes_on: None,
+            shot_ring: VecDeque::new(),
+        };
+        let result = execute_step(0, &book[0], &ctx, &mut state, &mut driver, &mut store);
+        assert!(matches!(result, StepResult::Done));
+        let seq: Vec<&str> = store.seen.iter().filter_map(|o| o.as_deref()).collect();
+        assert_eq!(
+            seq,
+            [
+                "dispatched:step0:attempt0",
+                "emit_confirmed:step0:attempt0",
+                "confirmed:step0:attempt0",
+            ]
+        );
     }
 
     #[test]

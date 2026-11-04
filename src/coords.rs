@@ -36,17 +36,51 @@ pub struct FrameTransform {
     pub nested_offset: (f64, f64),
     /// CSS transform scale applied to this frame's document.
     pub css_scale: f64,
+    /// Transform origin the CSS scale is applied around, in this frame's
+    /// document coordinates, CSS px. Per the W3C CSS Transforms spec the
+    /// scale applies as translate(origin) -> scale -> translate(-origin);
+    /// assuming the origin is (0,0) produces a systematic offset for
+    /// transformed frames. Callers that genuinely lack the origin must
+    /// pass (0.0, 0.0) explicitly; the transform itself applies no silent
+    /// default.
+    pub transform_origin: (f64, f64),
     /// Device pixel ratio reported for this frame. Carried so the escalation
     /// payload can record the full coordinate mapping; the CSS-space chain
     /// above does not consume it.
     pub dpr: f64,
 }
 
-fn finite_or(v: f64, fallback: f64) -> f64 {
+/// Named coordinate-mapping failures. Invalid inputs are reported, never
+/// silently corrected: a NaN scroll mapping to the screen origin would
+/// click the wrong place with no error signal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CoordError {
+    /// A coordinate input was NaN or infinite.
+    NonFiniteInput { field: &'static str },
+    /// The CSS scale was NaN, infinite, or zero.
+    InvalidScale { field: &'static str },
+}
+
+impl std::fmt::Display for CoordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoordError::NonFiniteInput { field } => {
+                write!(f, "non-finite coordinate input: {field}")
+            }
+            CoordError::InvalidScale { field } => {
+                write!(f, "invalid CSS scale (NaN, infinite, or zero): {field}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CoordError {}
+
+fn finite(v: f64, field: &'static str) -> Result<f64, CoordError> {
     if v.is_finite() {
-        v
+        Ok(v)
     } else {
-        fallback
+        Err(CoordError::NonFiniteInput { field })
     }
 }
 
@@ -55,47 +89,69 @@ fn finite_or(v: f64, fallback: f64) -> f64 {
 /// `chain[0]` is the frame that owns the point; the last entry is the main
 /// frame (usually the identity transform). Each step maps the point from the
 /// frame's document coordinates into its parent's coordinates: subtract the
-/// scroll, apply the CSS scale, then add the content-box origin and the
-/// nested offset.
+/// scroll and the transform origin, apply the CSS scale around the origin,
+/// then add the origin back plus the content-box origin and the nested
+/// offset. Returns [`CoordError`] on non-finite inputs or a degenerate
+/// scale instead of silently substituting values.
 pub fn document_to_main_viewport(
     doc: FrameDocumentCss,
     chain: &[FrameTransform],
-) -> MainViewportCss {
-    let (mut x, mut y) = (finite_or(doc.0, 0.0), finite_or(doc.1, 0.0));
+) -> Result<MainViewportCss, CoordError> {
+    let (mut x, mut y) = (finite(doc.0, "doc.x")?, finite(doc.1, "doc.y")?);
     for t in chain {
-        let scale = if t.css_scale.is_finite() && t.css_scale != 0.0 {
-            t.css_scale
-        } else {
-            1.0
-        };
-        x = (x - finite_or(t.scroll.0, 0.0)) * scale
-            + finite_or(t.content_origin.0, 0.0)
-            + finite_or(t.nested_offset.0, 0.0);
-        y = (y - finite_or(t.scroll.1, 0.0)) * scale
-            + finite_or(t.content_origin.1, 0.0)
-            + finite_or(t.nested_offset.1, 0.0);
+        let scale = finite(t.css_scale, "css_scale")?;
+        if scale == 0.0 {
+            return Err(CoordError::InvalidScale { field: "css_scale" });
+        }
+        let (sx, sy) = (
+            finite(t.scroll.0, "scroll.x")?,
+            finite(t.scroll.1, "scroll.y")?,
+        );
+        let (ox, oy) = (
+            finite(t.transform_origin.0, "transform_origin.x")?,
+            finite(t.transform_origin.1, "transform_origin.y")?,
+        );
+        let (cx, cy) = (
+            finite(t.content_origin.0, "content_origin.x")?,
+            finite(t.content_origin.1, "content_origin.y")?,
+        );
+        let (nx, ny) = (
+            finite(t.nested_offset.0, "nested_offset.x")?,
+            finite(t.nested_offset.1, "nested_offset.y")?,
+        );
+        x = (x - sx - ox) * scale + ox + cx + nx;
+        y = (y - sy - oy) * scale + oy + cy + ny;
     }
-    MainViewportCss(finite_or(x, 0.0), finite_or(y, 0.0))
+    Ok(MainViewportCss(x, y))
 }
 
 /// The ONE viewport-to-device function, used by the driver and the hit test.
 ///
 /// Applies page zoom and the device pixel ratio, then rounds to whole device
 /// pixels. `window_origin` is the X11 client-window content origin in root
-/// device px (typed, never a bare integer pair). A non-finite or
-/// non-positive zoom*DPR falls back to 1.0; non-finite results fall back
-/// to 0.0.
+/// device px (typed, never a bare integer pair). A non-finite input or a
+/// non-positive zoom*DPR is a [`CoordError`], not a silent fallback.
 pub fn to_screen(
     v: MainViewportCss,
     zoom: f64,
     dpr: f64,
     window_origin: RootDevicePx,
-) -> RootDevicePx {
-    let scale = finite_or(zoom * dpr, 0.0);
-    let scale = if scale > 0.0 { scale } else { 1.0 };
-    let x = finite_or(window_origin.0, 0.0) + finite_or(v.0, 0.0) * scale;
-    let y = finite_or(window_origin.1, 0.0) + finite_or(v.1, 0.0) * scale;
-    RootDevicePx(finite_or(x, 0.0).round(), finite_or(y, 0.0).round())
+) -> Result<RootDevicePx, CoordError> {
+    let (vx, vy) = (finite(v.0, "viewport.x")?, finite(v.1, "viewport.y")?);
+    let zoom = finite(zoom, "zoom")?;
+    let dpr = finite(dpr, "dpr")?;
+    let (ox, oy) = (
+        finite(window_origin.0, "window_origin.x")?,
+        finite(window_origin.1, "window_origin.y")?,
+    );
+    let scale = zoom * dpr;
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(CoordError::InvalidScale { field: "zoom*dpr" });
+    }
+    Ok(RootDevicePx(
+        (ox + vx * scale).round(),
+        (oy + vy * scale).round(),
+    ))
 }
 
 /// Inverse of `to_screen`: device point back into main-viewport CSS px.
@@ -105,30 +161,52 @@ pub fn screen_to_main_viewport(
     zoom: f64,
     dpr: f64,
     window_origin: RootDevicePx,
-) -> MainViewportCss {
-    let scale = finite_or(zoom * dpr, 0.0);
-    let scale = if scale > 0.0 { scale } else { 1.0 };
-    MainViewportCss(
-        (finite_or(r.0, 0.0) - finite_or(window_origin.0, 0.0)) / scale,
-        (finite_or(r.1, 0.0) - finite_or(window_origin.1, 0.0)) / scale,
-    )
+) -> Result<MainViewportCss, CoordError> {
+    let (rx, ry) = (finite(r.0, "device.x")?, finite(r.1, "device.y")?);
+    let zoom = finite(zoom, "zoom")?;
+    let dpr = finite(dpr, "dpr")?;
+    let (ox, oy) = (
+        finite(window_origin.0, "window_origin.x")?,
+        finite(window_origin.1, "window_origin.y")?,
+    );
+    let scale = zoom * dpr;
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(CoordError::InvalidScale { field: "zoom*dpr" });
+    }
+    Ok(MainViewportCss((rx - ox) / scale, (ry - oy) / scale))
 }
 
 /// Inverse of `document_to_main_viewport`, for round-trip tests.
-pub fn main_viewport_to_document(v: MainViewportCss, chain: &[FrameTransform]) -> FrameDocumentCss {
-    let (mut x, mut y) = (finite_or(v.0, 0.0), finite_or(v.1, 0.0));
+pub fn main_viewport_to_document(
+    v: MainViewportCss,
+    chain: &[FrameTransform],
+) -> Result<FrameDocumentCss, CoordError> {
+    let (mut x, mut y) = (finite(v.0, "viewport.x")?, finite(v.1, "viewport.y")?);
     for t in chain.iter().rev() {
-        let scale = if t.css_scale.is_finite() && t.css_scale != 0.0 {
-            t.css_scale
-        } else {
-            1.0
-        };
-        x = (x - finite_or(t.content_origin.0, 0.0) - finite_or(t.nested_offset.0, 0.0)) / scale
-            + finite_or(t.scroll.0, 0.0);
-        y = (y - finite_or(t.content_origin.1, 0.0) - finite_or(t.nested_offset.1, 0.0)) / scale
-            + finite_or(t.scroll.1, 0.0);
+        let scale = finite(t.css_scale, "css_scale")?;
+        if scale == 0.0 {
+            return Err(CoordError::InvalidScale { field: "css_scale" });
+        }
+        let (sx, sy) = (
+            finite(t.scroll.0, "scroll.x")?,
+            finite(t.scroll.1, "scroll.y")?,
+        );
+        let (ox, oy) = (
+            finite(t.transform_origin.0, "transform_origin.x")?,
+            finite(t.transform_origin.1, "transform_origin.y")?,
+        );
+        let (cx, cy) = (
+            finite(t.content_origin.0, "content_origin.x")?,
+            finite(t.content_origin.1, "content_origin.y")?,
+        );
+        let (nx, ny) = (
+            finite(t.nested_offset.0, "nested_offset.x")?,
+            finite(t.nested_offset.1, "nested_offset.y")?,
+        );
+        x = (x - cx - nx - ox) / scale + ox + sx;
+        y = (y - cy - ny - oy) / scale + oy + sy;
     }
-    FrameDocumentCss(finite_or(x, 0.0), finite_or(y, 0.0))
+    Ok(FrameDocumentCss(x, y))
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +246,11 @@ pub struct FrameLink {
     /// CSS `zoom`/transform scale applied to this frame's document
     /// (1.0 unless the page zooms a frame).
     pub css_scale: f64,
+    /// Transform origin the CSS scale applies around, in this frame's
+    /// document coordinates, CSS px. CDP does not report it; captures
+    /// set (0.0, 0.0) explicitly with the documented assumption that
+    /// transformed frames are rare in the target lanes.
+    pub transform_origin: (f64, f64),
     /// Device pixel ratio governing this frame.
     pub dpr: f64,
 }
@@ -265,6 +348,7 @@ pub fn build_chain(
             content_origin: link.content_origin,
             nested_offset: link.nested_offset,
             css_scale: link.css_scale,
+            transform_origin: link.transform_origin,
             dpr: link.dpr,
         });
         match &link.parent_id {
@@ -285,40 +369,43 @@ mod tests {
             content_origin: (0.0, 0.0),
             nested_offset: (0.0, 0.0),
             css_scale: 1.0,
+            transform_origin: (0.0, 0.0),
             dpr: 1.0,
         }
     }
 
     #[test]
-    fn chain_identity_passthrough() {
+    fn chain_identity_passthrough() -> Result<(), CoordError> {
         let doc = FrameDocumentCss(120.0, 340.0);
-        let vp = document_to_main_viewport(doc, &[identity_frame()]);
+        let vp = document_to_main_viewport(doc, &[identity_frame()])?;
         assert!((vp.0 - 120.0).abs() < 1e-9);
         assert!((vp.1 - 340.0).abs() < 1e-9);
+        Ok(())
     }
 
     #[test]
-    fn round_trip_dpr_1_and_2() {
+    fn round_trip_dpr_1_and_2() -> Result<(), CoordError> {
         let doc = FrameDocumentCss(120.0, 340.0);
         let chain = [identity_frame()];
-        let vp = document_to_main_viewport(doc, &chain);
+        let vp = document_to_main_viewport(doc, &chain)?;
         let origin = RootDevicePx(10.0, 20.0);
         for dpr in [1.0f64, 2.0f64] {
-            let dev = to_screen(vp, 1.0, dpr, origin);
+            let dev = to_screen(vp, 1.0, dpr, origin)?;
             // to_screen is the single conversion path: output is whole pixels.
             assert_eq!(dev.0.fract(), 0.0);
             assert_eq!(dev.1.fract(), 0.0);
-            let back = screen_to_main_viewport(dev, 1.0, dpr, origin);
+            let back = screen_to_main_viewport(dev, 1.0, dpr, origin)?;
             assert!((back.0 - vp.0).abs() < 1e-9);
             assert!((back.1 - vp.1).abs() < 1e-9);
-            let doc_back = main_viewport_to_document(back, &chain);
+            let doc_back = main_viewport_to_document(back, &chain)?;
             assert!((doc_back.0 - doc.0).abs() < 1e-9);
             assert!((doc_back.1 - doc.1).abs() < 1e-9);
         }
+        Ok(())
     }
 
     #[test]
-    fn scroll_and_nested_frame() {
+    fn scroll_and_nested_frame() -> Result<(), CoordError> {
         // Inner frame scrolled by (50, 80); its content box sits at (200, 150)
         // in the parent; OOPIF nested offset (5, 5); unit CSS scale.
         let inner = FrameTransform {
@@ -326,57 +413,106 @@ mod tests {
             content_origin: (200.0, 150.0),
             nested_offset: (5.0, 5.0),
             css_scale: 1.0,
+            transform_origin: (0.0, 0.0),
             dpr: 2.0,
         };
         let chain = [inner, identity_frame()];
         let doc = FrameDocumentCss(100.0, 100.0);
-        let vp = document_to_main_viewport(doc, &chain);
+        let vp = document_to_main_viewport(doc, &chain)?;
         // (100-50) + 200 + 5 = 255 ; (100-80) + 150 + 5 = 175
         assert!((vp.0 - 255.0).abs() < 1e-9);
         assert!((vp.1 - 175.0).abs() < 1e-9);
 
         // to_screen at zoom 1.25, DPR 2.0, origin (10, 20):
         // x = 10 + 255*2.5 = 647.5 -> 648 ; y = 20 + 175*2.5 = 457.5 -> 458
-        let dev = to_screen(vp, 1.25, 2.0, RootDevicePx(10.0, 20.0));
+        let dev = to_screen(vp, 1.25, 2.0, RootDevicePx(10.0, 20.0))?;
         assert_eq!(dev.0, 648.0);
         assert_eq!(dev.1, 458.0);
 
         // Round trip stays within one document px (rounding loss only).
-        let back = screen_to_main_viewport(dev, 1.25, 2.0, RootDevicePx(10.0, 20.0));
-        let doc_back = main_viewport_to_document(back, &chain);
+        let back = screen_to_main_viewport(dev, 1.25, 2.0, RootDevicePx(10.0, 20.0))?;
+        let doc_back = main_viewport_to_document(back, &chain)?;
         assert!((doc_back.0 - 100.0).abs() < 1.0);
         assert!((doc_back.1 - 100.0).abs() < 1.0);
+        Ok(())
     }
 
     #[test]
-    fn css_scale_walks_the_chain() {
+    fn css_scale_walks_the_chain() -> Result<(), CoordError> {
         let scaled = FrameTransform {
             scroll: (0.0, 0.0),
             content_origin: (10.0, 10.0),
             nested_offset: (0.0, 0.0),
             css_scale: 2.0,
+            transform_origin: (0.0, 0.0),
             dpr: 1.0,
         };
-        let vp = document_to_main_viewport(FrameDocumentCss(5.0, 5.0), &[scaled, identity_frame()]);
+        let vp =
+            document_to_main_viewport(FrameDocumentCss(5.0, 5.0), &[scaled, identity_frame()])?;
         assert!((vp.0 - 20.0).abs() < 1e-9);
         assert!((vp.1 - 20.0).abs() < 1e-9);
-        let doc_back = main_viewport_to_document(vp, &[scaled, identity_frame()]);
+        let doc_back = main_viewport_to_document(vp, &[scaled, identity_frame()])?;
         assert!((doc_back.0 - 5.0).abs() < 1e-9);
         assert!((doc_back.1 - 5.0).abs() < 1e-9);
+        Ok(())
     }
 
     #[test]
-    fn to_screen_guards_non_finite_scale() {
-        let vp = MainViewportCss(10.0, 10.0);
+    fn transform_origin_scales_around_origin() -> Result<(), CoordError> {
+        // Regression test for the missing transform-origin: CSS scale
+        // applies as translate(origin) -> scale -> translate(-origin).
+        // Frame scaled 2x around origin (10, 10), no scroll, no offsets.
+        let scaled = FrameTransform {
+            scroll: (0.0, 0.0),
+            content_origin: (0.0, 0.0),
+            nested_offset: (0.0, 0.0),
+            css_scale: 2.0,
+            transform_origin: (10.0, 10.0),
+            dpr: 1.0,
+        };
+        // (5-0-10)*2 + 10 = 0. The old origin-agnostic formula gave 10.
+        let vp = document_to_main_viewport(FrameDocumentCss(5.0, 5.0), &[scaled])?;
+        assert!((vp.0 - 0.0).abs() < 1e-9, "got {}", vp.0);
+        assert!((vp.1 - 0.0).abs() < 1e-9, "got {}", vp.1);
+        // The origin itself is the fixed point: (10-10)*2 + 10 = 10.
+        let vp = document_to_main_viewport(FrameDocumentCss(10.0, 10.0), &[scaled])?;
+        assert!((vp.0 - 10.0).abs() < 1e-9);
+        // Inverse round-trips through the origin-aware formula.
+        let doc_back = main_viewport_to_document(vp, &[scaled])?;
+        assert!((doc_back.0 - 10.0).abs() < 1e-9);
+        assert!((doc_back.1 - 10.0).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn non_finite_inputs_are_errors_not_silent_fallbacks() {
+        // The old finite_or silently mapped these to 0.0/1.0; now they
+        // are named errors. This is the regression test for the silent
+        // correction: none of these may produce a coordinate.
+        let good_chain = [identity_frame()];
         let origin = RootDevicePx(0.0, 0.0);
+        assert!(document_to_main_viewport(FrameDocumentCss(f64::NAN, 0.0), &good_chain).is_err());
+        assert!(
+            document_to_main_viewport(FrameDocumentCss(0.0, f64::INFINITY), &good_chain).is_err()
+        );
+        let mut bad_scroll = identity_frame();
+        bad_scroll.scroll = (f64::NAN, 0.0);
+        assert!(document_to_main_viewport(FrameDocumentCss(1.0, 1.0), &[bad_scroll]).is_err());
+        let mut bad_scale = identity_frame();
+        bad_scale.css_scale = 0.0;
+        assert_eq!(
+            document_to_main_viewport(FrameDocumentCss(1.0, 1.0), &[bad_scale]),
+            Err(CoordError::InvalidScale { field: "css_scale" })
+        );
+        let mut bad_scale = identity_frame();
+        bad_scale.css_scale = f64::NAN;
+        assert!(document_to_main_viewport(FrameDocumentCss(1.0, 1.0), &[bad_scale]).is_err());
+        let vp = MainViewportCss(10.0, 10.0);
         for zoom in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
-            let d = to_screen(vp, zoom, 1.0, origin);
-            assert!(d.0.is_finite() && d.1.is_finite());
-            assert_eq!(d.0.fract(), 0.0);
+            assert!(to_screen(vp, zoom, 1.0, origin).is_err(), "zoom={zoom}");
         }
-        // Non-finite inputs never produce non-finite output.
-        let d = to_screen(MainViewportCss(f64::NAN, f64::NAN), 1.0, 1.0, origin);
-        assert!(d.0.is_finite() && d.1.is_finite());
+        assert!(to_screen(MainViewportCss(f64::NAN, 1.0), 1.0, 1.0, origin).is_err());
+        assert!(to_screen(vp, 1.0, 1.0, RootDevicePx(f64::INFINITY, 0.0)).is_err());
     }
 
     fn three_level_links() -> Vec<FrameLink> {
@@ -388,6 +524,7 @@ mod tests {
                 content_origin: (0.0, 0.0),
                 nested_offset: (0.0, 0.0),
                 css_scale: 1.0,
+                transform_origin: (0.0, 0.0),
                 dpr: 2.0,
             },
             FrameLink {
@@ -397,6 +534,7 @@ mod tests {
                 content_origin: (200.0, 150.0),
                 nested_offset: (0.0, 0.0),
                 css_scale: 1.0,
+                transform_origin: (0.0, 0.0),
                 dpr: 2.0,
             },
             FrameLink {
@@ -406,6 +544,7 @@ mod tests {
                 content_origin: (50.0, 60.0),
                 nested_offset: (7.0, 3.0), // OOPIF-style nested offset
                 css_scale: 1.0,
+                transform_origin: (0.0, 0.0),
                 dpr: 2.0,
             },
         ]
@@ -434,10 +573,11 @@ mod tests {
         // main:       (327-0) = 327 ; (313-100) = 213
         let links = three_level_links();
         let chain = build_chain(&links, "grandchild").expect("chain builds");
-        let vp = document_to_main_viewport(FrameDocumentCss(100.0, 100.0), &chain);
+        let vp =
+            document_to_main_viewport(FrameDocumentCss(100.0, 100.0), &chain).expect("chain math");
         assert!((vp.0 - 327.0).abs() < 1e-9);
         assert!((vp.1 - 213.0).abs() < 1e-9);
-        let back = main_viewport_to_document(vp, &chain);
+        let back = main_viewport_to_document(vp, &chain).expect("inverse");
         assert!((back.0 - 100.0).abs() < 1e-9);
         assert!((back.1 - 100.0).abs() < 1e-9);
     }

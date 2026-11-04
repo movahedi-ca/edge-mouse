@@ -44,6 +44,12 @@ pub const N_STORED_FLOATS: usize = 11_394;
 /// Exact artifact length in bytes: 16 + 11394*4.
 pub const BIN_LEN: usize = 45_592;
 
+/// Calibration bounds for inv_temp: below the minimum the softmax
+/// flattens toward uniform (random ranking); above the maximum,
+/// logits * inv_temp risks overflow. Enforced at load time.
+pub const INV_TEMP_MIN: f32 = 1e-3;
+pub const INV_TEMP_MAX: f32 = 1e3;
+
 const OFF_W1: usize = 16;
 const OFF_B1: usize = OFF_W1 + 9216 * 4;
 const OFF_W2: usize = OFF_B1 + 64 * 4;
@@ -167,7 +173,8 @@ pub enum LoadError {
     BadPadDim { got: u16 },
     /// A stored float is NaN or infinite (index into the 11,394 body floats).
     NonFinite { index: usize },
-    /// inv_temp is not finite and positive (it scales the shipped softmax).
+    /// inv_temp is not finite or not in [INV_TEMP_MIN, INV_TEMP_MAX]
+    /// (it scales the shipped softmax).
     BadInvTemp { got: f32 },
 }
 
@@ -206,7 +213,7 @@ impl std::fmt::Display for LoadError {
             LoadError::BadInvTemp { got } => {
                 write!(
                     f,
-                    "s1 artifact bad inv_temp: {got} (must be finite and positive)"
+                    "s1 artifact bad inv_temp: {got} (must be finite and in [{INV_TEMP_MIN}, {INV_TEMP_MAX}])"
                 )
             }
         }
@@ -222,7 +229,7 @@ pub enum InferError {
     BadCount(usize),
     /// fewer than n rows supplied.
     ShortInput { need: usize, got: usize },
-    /// inv_temp not finite and positive.
+    /// inv_temp not finite or not in [INV_TEMP_MIN, INV_TEMP_MAX].
     BadInvTemp,
 }
 
@@ -359,6 +366,13 @@ impl StagedWeights {
         // NaN/inf were rejected by the finite check above, so this
         // comparison is total here.
         if self.inv_temp <= 0.0 {
+            return Err(LoadError::BadInvTemp { got: self.inv_temp });
+        }
+        // Calibration bounds: near-zero inv_temp flattens the softmax
+        // toward uniform (the ranker degenerates into random selection);
+        // huge inv_temp risks overflow in logits * inv_temp. Both are
+        // rejected rather than silently accepted.
+        if !(INV_TEMP_MIN..=INV_TEMP_MAX).contains(&self.inv_temp) {
             return Err(LoadError::BadInvTemp { got: self.inv_temp });
         }
         Ok(S1MouseWeights {
@@ -695,6 +709,42 @@ mod tests {
         bad[OFF_TEMP..OFF_TEMP + 4].copy_from_slice(&(-1.5f32).to_le_bytes());
         let err = S1MouseWeights::load_from_bytes(&bad).unwrap_err();
         assert_eq!(err, LoadError::BadInvTemp { got: -1.5 });
+    }
+
+    #[test]
+    fn reject_degenerate_inv_temp_bounds() {
+        // Near-zero flattens the softmax to uniform (random ranking);
+        // huge values risk overflow. Both must be rejected, not just
+        // non-finite and non-positive.
+        for &v in &[1e-30f32, 1e-4f32, 1e30f32] {
+            let mut bad = GOLDEN_BIN.to_vec();
+            bad[OFF_TEMP..OFF_TEMP + 4].copy_from_slice(&v.to_le_bytes());
+            let err = S1MouseWeights::load_from_bytes(&bad).unwrap_err();
+            assert_eq!(err, LoadError::BadInvTemp { got: v }, "inv_temp={v}");
+        }
+        // Non-finite is still rejected by the finite check (inv_temp is
+        // the last of the 11,394 stored floats).
+        for &v in &[f32::INFINITY, f32::NAN] {
+            let mut bad = GOLDEN_BIN.to_vec();
+            bad[OFF_TEMP..OFF_TEMP + 4].copy_from_slice(&v.to_le_bytes());
+            let err = S1MouseWeights::load_from_bytes(&bad).unwrap_err();
+            assert_eq!(
+                err,
+                LoadError::NonFinite {
+                    index: N_STORED_FLOATS - 1
+                },
+                "inv_temp={v}"
+            );
+        }
+        // The bounds themselves are accepted.
+        for &v in &[INV_TEMP_MIN, 1.7f32, INV_TEMP_MAX] {
+            let mut good = GOLDEN_BIN.to_vec();
+            good[OFF_TEMP..OFF_TEMP + 4].copy_from_slice(&v.to_le_bytes());
+            assert!(
+                S1MouseWeights::load_from_bytes(&good).is_ok(),
+                "inv_temp={v} should load"
+            );
+        }
     }
 
     #[test]

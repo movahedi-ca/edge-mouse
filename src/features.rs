@@ -24,8 +24,9 @@
 //! with the FxHash-like u64: h = 0, then per UTF-8 byte
 //! `h = ((h rotated left 5) XOR byte) * 0x517cc1b727220a95` (wrapping).
 //! `index = (h >> 1) % 64`, `sign = +1` when `h & 1 == 0` else `-1`.
-//! The signed count accumulates in f32 at `index`; the 64-vector is then
-//! L2-normalized (a zero vector stays zero).
+//! The signed count accumulates in i32 at `index` (exact for integer
+//! counts); the L2 norm is computed in f64 and the 64-vector is converted
+//! to f32 once at the end (a zero vector stays zero).
 //!
 //! Any change to this layout bumps FEATURE_SCHEMA_VERSION and rebuilds the
 //! golden pairs. The engine refuses to start on a schema mismatch.
@@ -133,18 +134,23 @@ fn fx_hash(bytes: &[u8]) -> u64 {
     h
 }
 
-fn l2_normalize(mut v: [f32; EMBED_DIM]) -> [f32; EMBED_DIM] {
-    let mut sum = 0.0f32;
-    for &x in &v {
+fn l2_normalize_f64(acc: &[i32; EMBED_DIM]) -> [f32; EMBED_DIM] {
+    // Exact integer counts in i32 (f32's 24-bit mantissa would quantize
+    // large counts); the norm accumulates in f64; conversion to f32
+    // happens once, at the end.
+    let mut sum = 0.0f64;
+    for &v in acc {
+        let x = v as f64;
         sum += x * x;
     }
     let n = sum.sqrt();
+    let mut out = [0.0f32; EMBED_DIM];
     if n.is_finite() && n > 0.0 {
-        for x in &mut v {
-            *x /= n;
+        for (o, &v) in out.iter_mut().zip(acc.iter()) {
+            *o = (v as f64 / n) as f32;
         }
     }
-    v
+    out
 }
 
 /// 64-dim signed hashed char-trigram embedding of `text`.
@@ -155,7 +161,7 @@ fn l2_normalize(mut v: [f32; EMBED_DIM]) -> [f32; EMBED_DIM] {
 pub fn ngram_embedding(text: &str) -> [f32; EMBED_DIM] {
     let norm = normalize_text(text);
     let chars: Vec<char> = norm.chars().collect();
-    let mut acc = [0.0f32; EMBED_DIM];
+    let mut acc = [0i32; EMBED_DIM];
     for n in 1..=3usize {
         if chars.len() < n {
             continue;
@@ -164,11 +170,11 @@ pub fn ngram_embedding(text: &str) -> [f32; EMBED_DIM] {
             let unit: String = chars[i..i + n].iter().collect();
             let h = fx_hash(unit.as_bytes());
             let idx = ((h >> 1) % EMBED_DIM as u64) as usize;
-            let sign = if h & 1 == 0 { 1.0f32 } else { -1.0f32 };
+            let sign = if h & 1 == 0 { 1i32 } else { -1i32 };
             acc[idx] += sign;
         }
     }
-    l2_normalize(acc)
+    l2_normalize_f64(&acc)
 }
 
 fn jaccard_token_overlap(a: &str, b: &str) -> f64 {
@@ -796,9 +802,9 @@ mod tests {
     /// Independent re-derivation of the trigram indices/signs straight from
     /// the documented algorithm, written separately from `ngram_embedding`:
     /// h = 0; per byte h = ((h rotated left 5) XOR byte) * K (wrapping);
-    /// index = (h >> 1) % 64; sign = +1 when h & 1 == 0 else -1; f32
-    /// accumulation, then L2 normalization. This pins the hardcoded goldens,
-    /// not just the production code.
+    /// index = (h >> 1) % 64; sign = +1 when h & 1 == 0 else -1; i32
+    /// accumulation, then f64 L2 normalization. This pins the hardcoded
+    /// goldens, not just the production code.
     fn ref_embedding(text: &str) -> [f32; EMBED_DIM] {
         const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
         let norm: String = text
@@ -807,7 +813,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let chars: Vec<char> = norm.chars().collect();
-        let mut acc = [0.0f32; EMBED_DIM];
+        let mut acc = [0i32; EMBED_DIM];
         for n in 1..=3usize {
             if chars.len() < n {
                 continue;
@@ -819,21 +825,23 @@ mod tests {
                     h = (h.rotate_left(5) ^ u64::from(byte)).wrapping_mul(K);
                 }
                 let idx = ((h >> 1) % EMBED_DIM as u64) as usize;
-                let sign = if h & 1 == 0 { 1.0f32 } else { -1.0f32 };
+                let sign = if h & 1 == 0 { 1i32 } else { -1i32 };
                 acc[idx] += sign;
             }
         }
-        let mut sum = 0.0f32;
+        let mut sum = 0.0f64;
         for &v in acc.iter() {
-            sum += v * v;
+            let x = v as f64;
+            sum += x * x;
         }
         let n = sum.sqrt();
+        let mut out = [0.0f32; EMBED_DIM];
         if n.is_finite() && n > 0.0 {
-            for v in acc.iter_mut() {
-                *v /= n;
+            for (o, &v) in out.iter_mut().zip(acc.iter()) {
+                *o = (v as f64 / n) as f32;
             }
         }
-        acc
+        out
     }
 
     #[test]

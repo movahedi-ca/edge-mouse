@@ -1981,18 +1981,24 @@ pub fn feed_resolver(engine: &mut super::resolver::ResolverEngine, snap: &Genera
             content_origin: (0.0, 0.0),
             nested_offset: (0.0, 0.0),
             css_scale: 1.0,
+            transform_origin: (0.0, 0.0),
             dpr: n.dpr,
         }];
-        engine.insert(
-            n.backend_node_id,
-            &n.role,
-            &n.name,
-            &n.text,
-            n.at,
-            n.wh,
-            n.enabled && n.visible,
-            &chain,
-        );
+        if engine
+            .insert(
+                n.backend_node_id,
+                &n.role,
+                &n.name,
+                &n.text,
+                n.at,
+                n.wh,
+                n.enabled && n.visible,
+                &chain,
+            )
+            .is_err()
+        {
+            engine.skipped_bad_coords += 1;
+        }
     }
     engine.finalize();
 }

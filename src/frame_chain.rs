@@ -190,6 +190,10 @@ pub async fn capture_frame_state(page: &Page, browser: Option<&Browser>) -> Resu
             content_origin,
             nested_offset: (0.0, 0.0),
             css_scale: 1.0,
+            // CDP does not report the CSS transform origin: pass (0,0)
+            // explicitly per the documented assumption (transformed
+            // frames are rare in the target lanes).
+            transform_origin: (0.0, 0.0),
             dpr,
         });
     }
@@ -316,6 +320,7 @@ mod tests {
                     content_origin: (0.0, 0.0),
                     nested_offset: (0.0, 0.0),
                     css_scale: 1.0,
+                    transform_origin: (0.0, 0.0),
                     dpr: 1.0,
                 },
                 FrameLink {
@@ -325,6 +330,7 @@ mod tests {
                     content_origin: (100.0, 200.0),
                     nested_offset: (0.0, 0.0),
                     css_scale: 1.0,
+                    transform_origin: (0.0, 0.0),
                     dpr: 1.0,
                 },
             ],

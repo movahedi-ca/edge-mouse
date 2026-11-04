@@ -74,13 +74,18 @@ use crate::vision::{
 struct EngineRng(u64);
 
 impl EngineRng {
+    /// xorshift64* : the xorshift64 shift sequence plus a multiplicative
+    /// output mixer. Plain xorshift64's low bits are linearly correlated;
+    /// the multiply breaks that up. Determinism is unchanged for a fixed
+    /// seed (the stream values differ from the pre-mixer stream, which is
+    /// fine: no test or fixture pins raw outputs).
     fn next(&mut self) -> u64 {
         let mut x = self.0 | 1;
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         self.0 = x;
-        x
+        x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 }
 
@@ -232,7 +237,8 @@ impl Actuator for X11Actuator {
         self.seed = self.seed.wrapping_add(1);
         let seed = self.seed;
         // Typed conversion: the ONE viewport-to-device path.
-        let to = to_screen(at, self.geom.zoom, self.geom.dpr, self.geom.window_origin);
+        let to = to_screen(at, self.geom.zoom, self.geom.dpr, self.geom.window_origin)
+            .map_err(|e| format!("coordinate mapping failed: {e}"))?;
         let from = self.pointer_now()?;
         let plan = plan_gesture(
             self.profile,
@@ -374,22 +380,32 @@ impl<P: Perception, A: Actuator, C: Capturer> EngineDriver<P, A, C> {
             content_origin: (0.0, 0.0),
             nested_offset: (0.0, 0.0),
             css_scale: 1.0,
+            transform_origin: (0.0, 0.0),
             dpr: 1.0,
         }];
         for n in &snap.nodes {
             if self.failed_ids.contains(&n.backend_node_id) {
                 continue;
             }
-            self.resolver.insert(
-                n.backend_node_id,
-                &n.role,
-                &n.name,
-                &n.text,
-                n.at,
-                n.wh,
-                n.enabled && n.visible,
-                &chain,
-            );
+            // Corrupt node geometry is skipped loudly (counted), never
+            // silently corrected: a NaN coordinate must not become a
+            // click at the screen origin.
+            if self
+                .resolver
+                .insert(
+                    n.backend_node_id,
+                    &n.role,
+                    &n.name,
+                    &n.text,
+                    n.at,
+                    n.wh,
+                    n.enabled && n.visible,
+                    &chain,
+                )
+                .is_err()
+            {
+                self.resolver.skipped_bad_coords += 1;
+            }
         }
         self.resolver.finalize();
         self.telemetry.record(Stage::Normalize, t.elapsed_nanos());
@@ -416,7 +432,9 @@ impl<P: Perception, A: Actuator, C: Capturer> EngineDriver<P, A, C> {
     }
 
     /// Region for the verifier: the hit's node box in device px.
-    fn verify_region(&self, hit: &Hit) -> (u32, u32, u32, u32) {
+    /// `None` when the coordinates are corrupt: the caller treats that
+    /// as `Inconclusive` (cannot verify), never a fabricated box.
+    fn verify_region(&self, hit: &Hit) -> Option<(u32, u32, u32, u32)> {
         let scale = self.geom.zoom * self.geom.dpr;
         let scale = if scale.is_finite() && scale > 0.0 {
             scale
@@ -440,10 +458,11 @@ impl<P: Perception, A: Actuator, C: Capturer> EngineDriver<P, A, C> {
             self.geom.zoom,
             self.geom.dpr,
             self.geom.window_origin,
-        );
+        )
+        .ok()?;
         let w = ((hit.w * scale).round() as u32).max(1);
         let h = ((hit.h * scale).round() as u32).max(1);
-        (tl.0.max(0.0) as u32, tl.1.max(0.0) as u32, w, h)
+        Some((tl.0.max(0.0) as u32, tl.1.max(0.0) as u32, w, h))
     }
 
     fn shortlist_text(&mut self, desc: &str) -> Vec<String> {
@@ -715,21 +734,23 @@ impl<P: Perception, A: Actuator, C: Capturer> StepDriver for EngineDriver<P, A, 
             .snapshot
             .by_backend
             .get(&hit.backend_node_id)
-            .map(|&i| {
+            .and_then(|&i| {
                 let n = &data.snapshot.nodes[i];
                 let tl = to_screen(
                     MainViewportCss(n.at.0, n.at.1),
                     self.geom.zoom,
                     self.geom.dpr,
                     self.geom.window_origin,
-                );
+                )
+                .ok()?;
                 let br = to_screen(
                     MainViewportCss(n.at.0 + n.wh.0, n.at.1 + n.wh.1),
                     self.geom.zoom,
                     self.geom.dpr,
                     self.geom.window_origin,
-                );
-                (tl.0, tl.1, (br.0 - tl.0).max(1.0), (br.1 - tl.1).max(1.0))
+                )
+                .ok()?;
+                Some((tl.0, tl.1, (br.0 - tl.0).max(1.0), (br.1 - tl.1).max(1.0)))
             })
             .unwrap_or((rep.to_px.0, rep.to_px.1, 1.0, 1.0));
 
@@ -750,11 +771,11 @@ impl<P: Perception, A: Actuator, C: Capturer> StepDriver for EngineDriver<P, A, 
     fn verify(&mut self, step: &Step) -> Verdict {
         let t_all = Instant::now();
         let (hit_id, pred_before, region) = match &self.last {
-            Some(l) => (
-                l.hit.backend_node_id,
-                l.pred_before.clone(),
-                self.verify_region(&l.hit),
-            ),
+            Some(l) => match self.verify_region(&l.hit) {
+                Some(region) => (l.hit.backend_node_id, l.pred_before.clone(), region),
+                // Corrupt geometry: cannot verify, never fabricate.
+                None => return Verdict::Inconclusive,
+            },
             None => return Verdict::Inconclusive,
         };
 

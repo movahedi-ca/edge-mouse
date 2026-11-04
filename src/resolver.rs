@@ -52,7 +52,9 @@ use std::path::PathBuf;
 
 use indexmap::IndexMap;
 
-use super::coords::{document_to_main_viewport, FrameDocumentCss, FrameTransform, MainViewportCss};
+use super::coords::{
+    document_to_main_viewport, CoordError, FrameDocumentCss, FrameTransform, MainViewportCss,
+};
 use super::features::{self, FeatureInputs, FEATURE_SCHEMA_VERSION};
 
 // ---------------------------------------------------------------------------
@@ -316,7 +318,7 @@ pub fn prepare_candidate(
     wh: (f64, f64),
     enabled_visible: bool,
     chain: &[FrameTransform],
-) -> Candidate {
+) -> Result<Candidate, CoordError> {
     let name_norm = normalize_desc(name);
     let text_norm = normalize_desc(text);
     let role_norm = normalize_desc(role);
@@ -349,9 +351,9 @@ pub fn prepare_candidate(
             Some(emb)
         });
 
-    let at = document_to_main_viewport(FrameDocumentCss(doc_xy.0, doc_xy.1), chain);
+    let at = document_to_main_viewport(FrameDocumentCss(doc_xy.0, doc_xy.1), chain)?;
 
-    Candidate {
+    Ok(Candidate {
         backend_node_id,
         generation,
         role: role.into(),
@@ -372,7 +374,7 @@ pub fn prepare_candidate(
             enabled_visible,
             embedding,
         },
-    }
+    })
 }
 // ---------------------------------------------------------------------------
 // Stage 1: real BM25 over the shared interner.
@@ -1354,6 +1356,9 @@ pub struct ResolverEngine {
     pub ranker: LinearRanker,
     /// Candidates skipped for missing embeddings (never silent zeros).
     pub skipped_no_embedding: u64,
+    /// Candidates skipped for corrupt geometry (non-finite coordinates or
+    /// degenerate scale): counted loudly, never silently corrected.
+    pub skipped_bad_coords: u64,
 }
 
 impl ResolverEngine {
@@ -1373,6 +1378,7 @@ impl ResolverEngine {
             calibrator: Calibrator::uncalibrated(),
             ranker: LinearRanker::zero(),
             skipped_no_embedding: 0,
+            skipped_bad_coords: 0,
         }
     }
 
@@ -1387,6 +1393,7 @@ impl ResolverEngine {
         self.live_by_id.clear();
         self.index = None;
         self.skipped_no_embedding = 0;
+        self.skipped_bad_coords = 0;
     }
 
     /// Insert one raw node. `doc_xy` is the box top-left in the owning
@@ -1403,7 +1410,7 @@ impl ResolverEngine {
         wh: (f64, f64),
         enabled_visible: bool,
         chain: &[FrameTransform],
-    ) -> u64 {
+    ) -> Result<u64, CoordError> {
         let c = prepare_candidate(
             &mut self.interner,
             &mut self.emb_cache,
@@ -1416,9 +1423,9 @@ impl ResolverEngine {
             wh,
             enabled_visible,
             chain,
-        );
+        )?;
         self.candidates.push(c);
-        backend_node_id
+        Ok(backend_node_id)
     }
 
     /// Build the BM25 index and the live backend_node_id -> index map.
@@ -1715,6 +1722,7 @@ mod tests {
             content_origin: (0.0, 0.0),
             nested_offset: (0.0, 0.0),
             css_scale: 1.0,
+            transform_origin: (0.0, 0.0),
             dpr: 1.0,
         }]
     }
@@ -1746,7 +1754,8 @@ mod tests {
                 (80.0, 30.0),
                 true,
                 &chain,
-            );
+            )
+            .expect("test insert");
         }
         e.finalize();
         e
@@ -2065,7 +2074,8 @@ mod tests {
             (80.0, 30.0),
             false,
             &chain,
-        );
+        )
+        .expect("test insert");
         e3.insert(
             2,
             "link",
@@ -2075,7 +2085,8 @@ mod tests {
             (80.0, 30.0),
             true,
             &chain,
-        );
+        )
+        .expect("test insert");
         e3.finalize();
         match e3.resolve("Search", &opts, &mut rng) {
             Resolution::Hit(h) => assert_ne!(h.stage, Stage::Exact),
@@ -2644,6 +2655,7 @@ mod eval_harness {
             content_origin: (0.0, 0.0),
             nested_offset: (0.0, 0.0),
             css_scale: 1.0,
+            transform_origin: (0.0, 0.0),
             dpr: 1.0,
         }];
         for n in &page.nodes {
@@ -2656,7 +2668,8 @@ mod eval_harness {
                 (n.w, n.h),
                 n.enabled_visible,
                 &chain,
-            );
+            )
+            .expect("test insert");
         }
         e.finalize();
         e
